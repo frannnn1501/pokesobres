@@ -1,5 +1,8 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { BASE1_CARDS } from "./base1data";
+import { auth, db, googleProvider } from "./firebase";
+import { signInWithPopup, signOut, onAuthStateChanged } from "firebase/auth";
+import { doc, getDoc, setDoc, runTransaction } from "firebase/firestore";
 
 function buildCards() {
   return BASE1_CARDS.map(([number, name, rarity]) => ({
@@ -15,7 +18,7 @@ function buildCards() {
   }));
 }
 
-const MAX_PACKS_PER_DAY = 4;
+const MAX_PACKS_PER_DAY = 3;
 const CARDS_PER_PACK = 6;
 const RARITY_WEIGHTS = {
   Common: 60,
@@ -45,15 +48,104 @@ function rarityRank(rarity) {
   return 0;
 }
 
-function loadJSON(_key, fallback) {
-  return fallback;
+function emptyUserDoc() {
+  return {
+    displayName: "",
+    lastOpenDate: todayStr(),
+    opensToday: 0,
+    collection: {},
+  };
 }
 
-function saveJSON(_key, _value) {}
+function particleCountFor(rarity) {
+  if (rarity === "Rare Holo") return 28;
+  if (rarity === "Rare") return 16;
+  return 0;
+}
+
+function ParticleBurst({ seed, count, color }) {
+  const particles = React.useMemo(() => {
+    const list = [];
+    for (let i = 0; i < count; i++) {
+      const angle = (Math.PI * 2 * i) / count + Math.random() * 0.4;
+      const dist = 60 + Math.random() * 90;
+      list.push({
+        id: `${seed}-${i}`,
+        dx: Math.cos(angle) * dist,
+        dy: Math.sin(angle) * dist,
+        size: 4 + Math.random() * 5,
+        delay: Math.random() * 80,
+      });
+    }
+    return list;
+  }, [seed, count]);
+
+  if (count === 0) return null;
+
+  return (
+    <>
+      <style>{`
+        @keyframes particleFly-${seed} { to { opacity: 0; } }
+      `}</style>
+      {particles.map((p) => (
+        <span
+          key={p.id}
+          style={{
+            position: "absolute",
+            left: "50%",
+            top: "50%",
+            width: `${p.size}px`,
+            height: `${p.size}px`,
+            borderRadius: "50%",
+            background: color,
+            boxShadow: `0 0 6px 1px ${color}`,
+            transform: `translate(-50%, -50%) translate(${p.dx}px, ${p.dy}px)`,
+            opacity: 0,
+            animation: `particleFly-${seed} 0.05s ${p.delay}ms forwards`,
+            transition: `transform 0.7s cubic-bezier(0.16, 0.8, 0.3, 1) ${p.delay}ms, opacity 0.7s ease ${p.delay}ms`,
+            pointerEvents: "none",
+          }}
+          ref={(el) => {
+            if (el) {
+              requestAnimationFrame(() => {
+                el.style.opacity = "1";
+                el.style.transform = "translate(-50%, -50%) translate(0, 0)";
+                requestAnimationFrame(() => {
+                  el.style.transform = `translate(-50%, -50%) translate(${p.dx}px, ${p.dy}px)`;
+                  el.style.opacity = "0";
+                });
+              });
+            }
+          }}
+        />
+      ))}
+    </>
+  );
+}
+
+function FlashOverlay({ active, color = "#fff" }) {
+  return (
+    <div
+      style={{
+        position: "absolute",
+        inset: 0,
+        background: color,
+        opacity: active ? 0.85 : 0,
+        transition: active ? "opacity 0.08s ease" : "opacity 0.3s ease",
+        pointerEvents: "none",
+        borderRadius: "inherit",
+      }}
+    />
+  );
+}
 
 export default function PokeSobres() {
   const [cards, setCards] = useState([]);
   const [loadState, setLoadState] = useState("loading");
+  const [user, setUser] = useState(null);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [authError, setAuthError] = useState("");
+  const [profile, setProfile] = useState(null);
   const [collection, setCollection] = useState({});
   const [opensToday, setOpensToday] = useState(0);
   const [view, setView] = useState("home");
@@ -61,16 +153,75 @@ export default function PokeSobres() {
   const [revealedCards, setRevealedCards] = useState([]);
   const [revealIndex, setRevealIndex] = useState(-1);
   const [packShaking, setPackShaking] = useState(false);
+  const [packFlash, setPackFlash] = useState(false);
+  const [opening, setOpening] = useState(false);
   const audioCtxRef = useRef(null);
 
   useEffect(() => {
     setCards(buildCards());
-    setLoadState("ready");
   }, []);
 
-  useEffect(() => {}, [collection]);
+  // Escuchar el estado de login
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, async (firebaseUser) => {
+      setUser(firebaseUser);
+      setAuthChecked(true);
+      if (firebaseUser) {
+        await loadOrCreateProfile(firebaseUser);
+      } else {
+        setProfile(null);
+        setCollection({});
+        setOpensToday(0);
+      }
+    });
+    return () => unsub();
+  }, []);
 
-  useEffect(() => {}, [opensToday]);
+  useEffect(() => {
+    if (authChecked) {
+      setLoadState("ready");
+    }
+  }, [authChecked]);
+
+  const loadOrCreateProfile = useCallback(async (firebaseUser) => {
+    const ref = doc(db, "users", firebaseUser.uid);
+    try {
+      const snap = await getDoc(ref);
+      let data;
+      if (snap.exists()) {
+        data = snap.data();
+        // Si cambió el día desde la última visita, no hace falta tocar nada acá:
+        // el contador real se resetea en la transacción de openPack.
+        if (data.lastOpenDate !== todayStr()) {
+          setOpensToday(0);
+        } else {
+          setOpensToday(data.opensToday || 0);
+        }
+      } else {
+        data = { ...emptyUserDoc(), displayName: firebaseUser.displayName || "" };
+        await setDoc(ref, data);
+        setOpensToday(0);
+      }
+      setProfile(data);
+      setCollection(data.collection || {});
+    } catch (err) {
+      setAuthError("No se pudo cargar tu perfil. Probá recargar la página.");
+    }
+  }, []);
+
+  const loginWithGoogle = useCallback(async () => {
+    setAuthError("");
+    try {
+      await signInWithPopup(auth, googleProvider);
+    } catch (err) {
+      setAuthError("No se pudo iniciar sesión. Probá de nuevo.");
+    }
+  }, []);
+
+  const logout = useCallback(async () => {
+    await signOut(auth);
+    setView("home");
+  }, []);
 
   const playTone = useCallback((freq, dur, type = "sine", vol = 0.05) => {
     try {
@@ -92,37 +243,78 @@ export default function PokeSobres() {
   }, []);
 
   const packsLeft = MAX_PACKS_PER_DAY - opensToday;
-  const canOpen = packsLeft > 0 && loadState === "ready" && !revealing;
+  const canOpen = user && packsLeft > 0 && loadState === "ready" && !revealing && !opening;
 
-  const openPack = useCallback(() => {
-    if (!canOpen) return;
+  const openPack = useCallback(async () => {
+    if (!canOpen || !user) return;
+    setOpening(true);
     setPackShaking(true);
     playTone(220, 0.15, "triangle", 0.04);
-    setTimeout(() => {
-      const commons = cards.filter((c) => c.rarity === "Common");
-      const others = cards.filter((c) => c.rarity !== "Common");
-      const pulled = [];
-      for (let i = 0; i < CARDS_PER_PACK - 1; i++) {
-        pulled.push(weightedPick(commons.length ? commons : cards));
-      }
-      pulled.push(weightedPick(others.length ? others : cards));
-      pulled.sort((a, b) => rarityRank(a.rarity) - rarityRank(b.rarity));
 
-      setCollection((prev) => {
-        const next = { ...prev };
-        for (const c of pulled) {
-          next[c.id] = (next[c.id] || 0) + 1;
+    // Sorteo de cartas en el cliente
+    const commons = cards.filter((c) => c.rarity === "Common");
+    const others = cards.filter((c) => c.rarity !== "Common");
+    const pulled = [];
+    for (let i = 0; i < CARDS_PER_PACK - 1; i++) {
+      pulled.push(weightedPick(commons.length ? commons : cards));
+    }
+    pulled.push(weightedPick(others.length ? others : cards));
+    pulled.sort((a, b) => rarityRank(a.rarity) - rarityRank(b.rarity));
+
+    const ref = doc(db, "users", user.uid);
+    try {
+      const result = await runTransaction(db, async (tx) => {
+        const snap = await tx.get(ref);
+        const data = snap.exists() ? snap.data() : emptyUserDoc();
+        const today = todayStr();
+        const isNewDay = data.lastOpenDate !== today;
+        const currentOpens = isNewDay ? 0 : data.opensToday || 0;
+
+        if (currentOpens >= MAX_PACKS_PER_DAY) {
+          throw new Error("LIMIT_REACHED");
         }
-        return next;
+
+        const newCollection = { ...(data.collection || {}) };
+        for (const c of pulled) {
+          newCollection[c.id] = (newCollection[c.id] || 0) + 1;
+        }
+
+        const newData = {
+          ...data,
+          displayName: user.displayName || data.displayName || "",
+          lastOpenDate: today,
+          opensToday: currentOpens + 1,
+          collection: newCollection,
+        };
+        tx.set(ref, newData);
+        return newData;
       });
-      setOpensToday((n) => n + 1);
-      setRevealedCards(pulled);
-      setRevealIndex(-1);
+
+      setCollection(result.collection);
+      setOpensToday(result.opensToday);
+      setProfile(result);
+      setTimeout(() => {
+        setPackFlash(true);
+        playTone(440, 0.2, "sine", 0.05);
+        setTimeout(() => {
+          setRevealedCards(pulled);
+          setRevealIndex(-1);
+          setPackShaking(false);
+          setPackFlash(false);
+          setRevealing(true);
+          setOpening(false);
+        }, 130);
+      }, 500);
+    } catch (err) {
       setPackShaking(false);
-      setRevealing(true);
-      playTone(440, 0.2, "sine", 0.05);
-    }, 700);
-  }, [canOpen, cards, playTone]);
+      setOpening(false);
+      if (err.message === "LIMIT_REACHED") {
+        setOpensToday(MAX_PACKS_PER_DAY);
+      } else {
+        setAuthError("No se pudo abrir el sobre. Probá de nuevo.");
+      }
+    }
+  }, [canOpen, cards, playTone, user]);
 
   const revealNext = useCallback(() => {
     setRevealIndex((i) => {
@@ -207,31 +399,56 @@ export default function PokeSobres() {
           <span style={{ fontSize: "26px" }}>{String.fromCodePoint(0x1f0cf)}</span>
           PokéSobres
         </div>
-        <div style={styles.nav}>
-          <button style={styles.navBtn(view === "home")} onClick={() => setView("home")}>
-            Abrir sobres
-          </button>
-          <button style={styles.navBtn(view === "collection")} onClick={() => setView("collection")}>
-            Mi colección
-          </button>
-        </div>
+        {user && (
+          <div style={styles.nav}>
+            <button style={styles.navBtn(view === "home")} onClick={() => setView("home")}>
+              Abrir sobres
+            </button>
+            <button style={styles.navBtn(view === "collection")} onClick={() => setView("collection")}>
+              Mi colección
+            </button>
+            <button
+              onClick={logout}
+              style={{
+                background: "transparent",
+                color: "#c9c3e0",
+                border: "1px solid rgba(255,255,255,0.15)",
+                borderRadius: "999px",
+                padding: "8px 16px",
+                fontSize: "13px",
+                cursor: "pointer",
+              }}
+              title={user.displayName || user.email}
+            >
+              Salir
+            </button>
+          </div>
+        )}
       </div>
 
       <div style={styles.main}>
-        {loadState === "loading" && <LoadingScreen />}
-        {loadState === "error" && <ErrorScreen />}
-        {loadState === "ready" && view === "home" && (
+        {authError && (
+          <div style={{ textAlign: "center", color: "#f0a0a0", marginBottom: "16px", fontSize: "14px" }}>
+            {authError}
+          </div>
+        )}
+        {!authChecked && <LoadingScreen />}
+        {authChecked && !user && <LoginScreen onLogin={loginWithGoogle} />}
+        {authChecked && user && loadState === "ready" && view === "home" && (
           <HomeView
             packsLeft={packsLeft}
             canOpen={canOpen}
+            opening={opening}
             openPack={openPack}
             packShaking={packShaking}
+            packFlash={packFlash}
             completion={completion}
             ownedUnique={ownedUnique}
             totalUnique={totalUnique}
+            displayName={user.displayName}
           />
         )}
-        {loadState === "ready" && view === "collection" && (
+        {authChecked && user && loadState === "ready" && view === "collection" && (
           <CollectionView cards={cards} collection={collection} ownedUnique={ownedUnique} totalUnique={totalUnique} />
         )}
       </div>
@@ -242,8 +459,57 @@ export default function PokeSobres() {
           revealIndex={revealIndex}
           onNext={revealNext}
           onClose={closeReveal}
+          playTone={playTone}
         />
       )}
+    </div>
+  );
+}
+
+function LoginScreen({ onLogin }) {
+  return (
+    <div style={{ textAlign: "center", padding: "60px 20px" }}>
+      <div style={{ fontSize: "50px", marginBottom: "16px" }}>{String.fromCodePoint(0x1f0cf)}</div>
+      <h1 style={{ fontSize: "24px", fontWeight: 700, marginBottom: "8px" }}>Bienvenido a PokéSobres</h1>
+      <p style={{ color: "#c9c3e0", marginBottom: "28px", fontSize: "14px" }}>
+        Iniciá sesión para guardar tu colección y abrir tus sobres todos los días.
+      </p>
+      <button
+        onClick={onLogin}
+        style={{
+          background: "#fff",
+          color: "#1f1f1f",
+          border: "none",
+          borderRadius: "999px",
+          padding: "12px 28px",
+          fontSize: "15px",
+          fontWeight: 600,
+          cursor: "pointer",
+          display: "inline-flex",
+          alignItems: "center",
+          gap: "10px",
+        }}
+      >
+        <svg width="18" height="18" viewBox="0 0 18 18">
+          <path
+            fill="#4285F4"
+            d="M17.64 9.2c0-.64-.06-1.25-.16-1.84H9v3.48h4.84c-.21 1.13-.85 2.09-1.81 2.73v2.27h2.92c1.71-1.57 2.69-3.89 2.69-6.64z"
+          />
+          <path
+            fill="#34A853"
+            d="M9 18c2.43 0 4.47-.8 5.96-2.18l-2.92-2.27c-.81.54-1.84.86-3.04.86-2.34 0-4.32-1.58-5.03-3.71H.96v2.33C2.44 15.98 5.48 18 9 18z"
+          />
+          <path
+            fill="#FBBC05"
+            d="M3.97 10.71c-.18-.54-.28-1.11-.28-1.71s.1-1.17.28-1.71V4.96H.96A8.99 8.99 0 0 0 0 9c0 1.45.35 2.83.96 4.04l3.01-2.33z"
+          />
+          <path
+            fill="#EA4335"
+            d="M9 3.58c1.32 0 2.5.45 3.44 1.35l2.58-2.58C13.46.89 11.43 0 9 0 5.48 0 2.44 2.02.96 4.96l3.01 2.33C4.68 5.16 6.66 3.58 9 3.58z"
+          />
+        </svg>
+        Iniciar sesión con Google
+      </button>
     </div>
   );
 }
@@ -268,9 +534,12 @@ function ErrorScreen() {
   );
 }
 
-function HomeView({ packsLeft, canOpen, openPack, packShaking, completion, ownedUnique, totalUnique }) {
+function HomeView({ packsLeft, canOpen, opening, openPack, packShaking, packFlash, completion, ownedUnique, totalUnique, displayName }) {
   return (
     <div style={{ textAlign: "center" }}>
+      {displayName && (
+        <p style={{ color: "#9d96c0", fontSize: "13px", marginBottom: "4px" }}>Hola, {displayName.split(" ")[0]}</p>
+      )}
       <h1 style={{ fontSize: "26px", fontWeight: 700, marginBottom: "4px" }}>Sobre Base Set</h1>
       <p style={{ color: "#c9c3e0", marginBottom: "28px" }}>
         {packsLeft > 0
@@ -281,10 +550,12 @@ function HomeView({ packsLeft, canOpen, openPack, packShaking, completion, owned
       <div
         onClick={openPack}
         style={{
+          position: "relative",
           width: "200px",
           height: "280px",
           margin: "0 auto 28px",
           borderRadius: "16px",
+          overflow: "hidden",
           background: "linear-gradient(145deg, #e8424a 0%, #b21f2d 55%, #7a121d 100%)",
           border: "3px solid #ffd95e",
           display: "flex",
@@ -293,14 +564,17 @@ function HomeView({ packsLeft, canOpen, openPack, packShaking, completion, owned
           justifyContent: "center",
           cursor: canOpen ? "pointer" : "not-allowed",
           opacity: canOpen ? 1 : 0.45,
-          transform: packShaking ? "rotate(-2deg) scale(1.02)" : "none",
-          transition: "transform 0.12s ease",
-          boxShadow: "0 12px 30px rgba(0,0,0,0.4)",
+          transform: packShaking ? "rotate(-3deg) scale(1.06)" : "none",
+          transition: packShaking ? "transform 0.09s ease-in-out" : "transform 0.2s ease",
+          boxShadow: packShaking
+            ? "0 0 40px 6px rgba(255,217,94,0.5), 0 12px 30px rgba(0,0,0,0.4)"
+            : "0 12px 30px rgba(0,0,0,0.4)",
         }}
       >
         <div style={{ fontSize: "44px", marginBottom: "10px" }}>{String.fromCodePoint(0x1f525)}</div>
         <div style={{ fontWeight: 700, fontSize: "18px", color: "#ffe9a8", letterSpacing: "1px" }}>BASE SET</div>
         <div style={{ fontSize: "12px", color: "#ffd0d0", marginTop: "6px" }}>6 cartas</div>
+        <FlashOverlay active={packFlash} />
       </div>
 
       <button
@@ -317,7 +591,7 @@ function HomeView({ packsLeft, canOpen, openPack, packShaking, completion, owned
           cursor: canOpen ? "pointer" : "not-allowed",
         }}
       >
-        {canOpen ? "Abrir sobre" : packsLeft <= 0 ? "Sin sobres hoy" : "Cargando..."}
+        {opening ? "Abriendo..." : canOpen ? "Abrir sobre" : packsLeft <= 0 ? "Sin sobres hoy" : "Cargando..."}
       </button>
 
       <div
@@ -416,7 +690,87 @@ function CollectionView({ cards, collection, ownedUnique, totalUnique }) {
   );
 }
 
-function RevealOverlay({ cards, revealIndex, onNext, onClose }) {
+function CardReveal({ card, revealKey, playTone }) {
+  const [stage, setStage] = useState("flash"); // flash -> popping -> settled
+  const isBig = card.rarity === "Rare Holo" || card.rarity === "Rare";
+  const particleColor = card.rarity === "Rare Holo" ? "#ffd95e" : "#9fd6ff";
+
+  useEffect(() => {
+    setStage("flash");
+    const t1 = setTimeout(() => setStage("popping"), isBig ? 130 : 30);
+    const t2 = setTimeout(() => setStage("settled"), isBig ? 600 : 350);
+    return () => {
+      clearTimeout(t1);
+      clearTimeout(t2);
+    };
+  }, [revealKey, isBig]);
+
+  return (
+    <div
+      style={{
+        position: "relative",
+        width: "240px",
+        textAlign: "center",
+      }}
+    >
+      <FlashOverlay active={stage === "flash" && isBig} color={particleColor} />
+      {stage !== "flash" && <ParticleBurst seed={revealKey} count={particleCountFor(card.rarity)} color={particleColor} />}
+
+      <div
+        style={{
+          transform:
+            stage === "flash"
+              ? "scale(0.25)"
+              : stage === "popping"
+              ? isBig
+                ? "scale(1.15)"
+                : "scale(1.03)"
+              : "scale(1)",
+          opacity: stage === "flash" ? 0 : 1,
+          transition:
+            stage === "flash"
+              ? "none"
+              : stage === "popping"
+              ? `transform ${isBig ? 0.4 : 0.22}s cubic-bezier(0.17, 0.89, 0.32, 1.49), opacity 0.2s ease`
+              : "transform 0.25s ease",
+        }}
+      >
+        <img
+          src={card.images.large || card.images.small}
+          alt={card.name}
+          onError={(e) => {
+            if (e.target.src !== card.images.small) {
+              e.target.src = card.images.small;
+            } else {
+              e.target.onerror = null;
+              e.target.src =
+                "data:image/svg+xml;utf8," +
+                encodeURIComponent(
+                  '<svg xmlns="http://www.w3.org/2000/svg" width="240" height="335"><rect width="240" height="335" fill="#352a55"/><text x="120" y="170" font-size="14" fill="#c9c3e0" text-anchor="middle">sin imagen</text></svg>'
+                );
+            }
+          }}
+          style={{
+            width: "100%",
+            borderRadius: "14px",
+            boxShadow:
+              card.rarity === "Rare Holo"
+                ? "0 0 50px 10px rgba(255,217,94,0.55)"
+                : card.rarity === "Rare"
+                ? "0 0 30px 6px rgba(159,214,255,0.4)"
+                : "0 8px 24px rgba(0,0,0,0.5)",
+          }}
+        />
+        <div style={{ marginTop: "14px", color: "#f4f1ea", fontWeight: 700, fontSize: "17px" }}>{card.name}</div>
+        <div style={{ marginTop: "2px", fontSize: "13px", fontWeight: 600, color: rarityColor(card.rarity) }}>
+          {card.rarity}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RevealOverlay({ cards, revealIndex, onNext, onClose, playTone }) {
   const allRevealed = revealIndex >= cards.length - 1;
   const current = revealIndex >= 0 ? cards[revealIndex] : null;
 
@@ -434,6 +788,7 @@ function RevealOverlay({ cards, revealIndex, onNext, onClose }) {
         cursor: revealIndex < cards.length - 1 ? "pointer" : "default",
         zIndex: 1000,
         padding: "20px",
+        overflow: "hidden",
       }}
     >
       {revealIndex === -1 ? (
@@ -460,47 +815,7 @@ function RevealOverlay({ cards, revealIndex, onNext, onClose }) {
         </div>
       ) : (
         <>
-          <div
-            key={current.id + revealIndex}
-            style={{
-              width: "240px",
-              animation: "none",
-              textAlign: "center",
-            }}
-          >
-            <img
-              src={current.images.large || current.images.small}
-              alt={current.name}
-              onError={(e) => {
-                if (e.target.src !== current.images.small) {
-                  e.target.src = current.images.small;
-                } else {
-                  e.target.onerror = null;
-                  e.target.src =
-                    "data:image/svg+xml;utf8," +
-                    encodeURIComponent(
-                      '<svg xmlns="http://www.w3.org/2000/svg" width="240" height="335"><rect width="240" height="335" fill="#352a55"/><text x="120" y="170" font-size="14" fill="#c9c3e0" text-anchor="middle">sin imagen</text></svg>'
-                    );
-                }
-              }}
-              style={{
-                width: "100%",
-                borderRadius: "14px",
-                boxShadow:
-                  current.rarity === "Rare Holo"
-                    ? "0 0 50px 10px rgba(255,217,94,0.55)"
-                    : current.rarity === "Rare"
-                    ? "0 0 30px 6px rgba(159,214,255,0.4)"
-                    : "0 8px 24px rgba(0,0,0,0.5)",
-              }}
-            />
-            <div style={{ marginTop: "14px", color: "#f4f1ea", fontWeight: 700, fontSize: "17px" }}>
-              {current.name}
-            </div>
-            <div style={{ marginTop: "2px", fontSize: "13px", fontWeight: 600, color: rarityColor(current.rarity) }}>
-              {current.rarity}
-            </div>
-          </div>
+          <CardReveal card={current} revealKey={`${current.id}-${revealIndex}`} playTone={playTone} />
 
           <div style={{ marginTop: "28px", display: "flex", gap: "6px" }}>
             {cards.map((_, i) => (

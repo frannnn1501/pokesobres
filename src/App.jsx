@@ -20,6 +20,13 @@ function buildCards() {
 
 const MAX_PACKS_PER_DAY = 4;
 const CARDS_PER_PACK = 6;
+const EXTRA_PACK_COST = 75;
+const SELL_PRICE = {
+  Common: 2,
+  Uncommon: 5,
+  Rare: 20,
+  "Rare Holo": 60,
+};
 const RARITY_WEIGHTS = {
   Common: 60,
   Uncommon: 30,
@@ -54,7 +61,24 @@ function emptyUserDoc() {
     lastOpenDate: todayStr(),
     opensToday: 0,
     collection: {},
+    coins: 0,
   };
+}
+
+function drawPack(cards) {
+  const commons = cards.filter((c) => c.rarity === "Common");
+  const others = cards.filter((c) => c.rarity !== "Common");
+  const pulled = [];
+  for (let i = 0; i < CARDS_PER_PACK - 1; i++) {
+    pulled.push(weightedPick(commons.length ? commons : cards));
+  }
+  pulled.push(weightedPick(others.length ? others : cards));
+  pulled.sort((a, b) => rarityRank(a.rarity) - rarityRank(b.rarity));
+  return pulled;
+}
+
+function sellPriceFor(rarity) {
+  return SELL_PRICE[rarity] || 1;
 }
 
 function particleCountFor(rarity) {
@@ -249,6 +273,7 @@ export default function PokeSobres() {
   const [profile, setProfile] = useState(null);
   const [collection, setCollection] = useState({});
   const [opensToday, setOpensToday] = useState(0);
+  const [coins, setCoins] = useState(0);
   const [view, setView] = useState("home");
   const [revealing, setRevealing] = useState(false);
   const [revealedCards, setRevealedCards] = useState([]);
@@ -273,6 +298,7 @@ export default function PokeSobres() {
         setProfile(null);
         setCollection({});
         setOpensToday(0);
+        setCoins(0);
       }
     });
     return () => unsub();
@@ -305,6 +331,7 @@ export default function PokeSobres() {
       }
       setProfile(data);
       setCollection(data.collection || {});
+      setCoins(data.coins || 0);
     } catch (err) {
       setAuthError("No se pudo cargar tu perfil. Probá recargar la página.");
     }
@@ -353,14 +380,7 @@ export default function PokeSobres() {
     playTone(440, 0.18, "sine", 0.06);
 
     // Sorteo de cartas en el cliente
-    const commons = cards.filter((c) => c.rarity === "Common");
-    const others = cards.filter((c) => c.rarity !== "Common");
-    const pulled = [];
-    for (let i = 0; i < CARDS_PER_PACK - 1; i++) {
-      pulled.push(weightedPick(commons.length ? commons : cards));
-    }
-    pulled.push(weightedPick(others.length ? others : cards));
-    pulled.sort((a, b) => rarityRank(a.rarity) - rarityRank(b.rarity));
+    const pulled = drawPack(cards);
 
     const ref = doc(db, "users", user.uid);
     try {
@@ -396,11 +416,20 @@ export default function PokeSobres() {
       setProfile(result);
       setTimeout(() => {
         setRevealedCards(pulled);
-        setRevealIndex(-1);
+        setRevealIndex(0);
         setPackFlash(false);
         setRevealing(true);
         setOpening(false);
         setPackTheme((prevTheme) => pickRandomTheme(prevTheme.id));
+        const firstCard = pulled[0];
+        if (firstCard.rarity === "Rare Holo") {
+          playTone(660, 0.35, "sine", 0.06);
+          playTone(880, 0.4, "sine", 0.04);
+        } else if (firstCard.rarity === "Rare") {
+          playTone(550, 0.25, "sine", 0.05);
+        } else {
+          playTone(330, 0.12, "triangle", 0.035);
+        }
       }, 150);
     } catch (err) {
       setPackFlash(false);
@@ -412,6 +441,105 @@ export default function PokeSobres() {
       }
     }
   }, [canOpen, cards, playTone, user]);
+
+  const sellCard = useCallback(
+    async (cardId) => {
+      if (!user) return;
+      const card = cards.find((c) => c.id === cardId);
+      if (!card) return;
+      const price = sellPriceFor(card.rarity);
+      const ref = doc(db, "users", user.uid);
+      try {
+        const result = await runTransaction(db, async (tx) => {
+          const snap = await tx.get(ref);
+          const data = snap.exists() ? snap.data() : emptyUserDoc();
+          const owned = (data.collection || {})[cardId] || 0;
+          if (owned <= 0) {
+            throw new Error("NOT_OWNED");
+          }
+          const newCollection = { ...data.collection };
+          if (owned <= 1) {
+            delete newCollection[cardId];
+          } else {
+            newCollection[cardId] = owned - 1;
+          }
+          const newData = {
+            ...data,
+            collection: newCollection,
+            coins: (data.coins || 0) + price,
+          };
+          tx.set(ref, newData);
+          return newData;
+        });
+        setCollection(result.collection);
+        setCoins(result.coins);
+        setProfile(result);
+        playTone(523, 0.1, "sine", 0.04);
+        playTone(659, 0.12, "sine", 0.04);
+      } catch (err) {
+        setAuthError("No se pudo vender la carta. Probá de nuevo.");
+      }
+    },
+    [user, cards, playTone]
+  );
+
+  const buyExtraPack = useCallback(async () => {
+    if (!user || opening || revealing) return;
+    if (coins < EXTRA_PACK_COST) return;
+    setOpening(true);
+    setPackFlash(true);
+    playTone(440, 0.18, "sine", 0.06);
+
+    const pulled = drawPack(cards);
+    const ref = doc(db, "users", user.uid);
+    try {
+      const result = await runTransaction(db, async (tx) => {
+        const snap = await tx.get(ref);
+        const data = snap.exists() ? snap.data() : emptyUserDoc();
+        const currentCoins = data.coins || 0;
+        if (currentCoins < EXTRA_PACK_COST) {
+          throw new Error("NOT_ENOUGH_COINS");
+        }
+        const newCollection = { ...(data.collection || {}) };
+        for (const c of pulled) {
+          newCollection[c.id] = (newCollection[c.id] || 0) + 1;
+        }
+        const newData = {
+          ...data,
+          displayName: user.displayName || data.displayName || "",
+          collection: newCollection,
+          coins: currentCoins - EXTRA_PACK_COST,
+        };
+        tx.set(ref, newData);
+        return newData;
+      });
+
+      setCollection(result.collection);
+      setCoins(result.coins);
+      setProfile(result);
+      setTimeout(() => {
+        setRevealedCards(pulled);
+        setRevealIndex(0);
+        setPackFlash(false);
+        setRevealing(true);
+        setOpening(false);
+        setPackTheme((prevTheme) => pickRandomTheme(prevTheme.id));
+        const firstCard = pulled[0];
+        if (firstCard.rarity === "Rare Holo") {
+          playTone(660, 0.35, "sine", 0.06);
+          playTone(880, 0.4, "sine", 0.04);
+        } else if (firstCard.rarity === "Rare") {
+          playTone(550, 0.25, "sine", 0.05);
+        } else {
+          playTone(330, 0.12, "triangle", 0.035);
+        }
+      }, 150);
+    } catch (err) {
+      setPackFlash(false);
+      setOpening(false);
+      setAuthError("No se pudo comprar el sobre. Probá de nuevo.");
+    }
+  }, [user, opening, revealing, coins, cards, playTone]);
 
   const revealNext = useCallback(() => {
     setRevealIndex((i) => {
@@ -498,6 +626,24 @@ export default function PokeSobres() {
         </div>
         {user && (
           <div style={styles.nav}>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "6px",
+                background: "rgba(255,217,94,0.12)",
+                border: "1px solid rgba(255,217,94,0.35)",
+                borderRadius: "999px",
+                padding: "8px 14px",
+                fontSize: "13px",
+                fontWeight: 700,
+                color: "#ffd95e",
+              }}
+              title="Tus monedas"
+            >
+              <span>{String.fromCodePoint(0x1fa99)}</span>
+              {coins}
+            </div>
             <button style={styles.navBtn(view === "home")} onClick={() => setView("home")}>
               Abrir sobres
             </button>
@@ -543,10 +689,20 @@ export default function PokeSobres() {
             ownedUnique={ownedUnique}
             totalUnique={totalUnique}
             displayName={user.displayName}
+            coins={coins}
+            buyExtraPack={buyExtraPack}
+            revealing={revealing}
           />
         )}
         {authChecked && user && loadState === "ready" && view === "collection" && (
-          <CollectionView cards={cards} collection={collection} ownedUnique={ownedUnique} totalUnique={totalUnique} />
+          <CollectionView
+            cards={cards}
+            collection={collection}
+            ownedUnique={ownedUnique}
+            totalUnique={totalUnique}
+            coins={coins}
+            onSell={sellCard}
+          />
         )}
       </div>
 
@@ -631,7 +787,22 @@ function ErrorScreen() {
   );
 }
 
-function HomeView({ packsLeft, canOpen, opening, openPack, packTheme, packFlash, completion, ownedUnique, totalUnique, displayName }) {
+function HomeView({
+  packsLeft,
+  canOpen,
+  opening,
+  openPack,
+  packTheme,
+  packFlash,
+  completion,
+  ownedUnique,
+  totalUnique,
+  displayName,
+  coins,
+  buyExtraPack,
+  revealing,
+}) {
+  const canBuyExtra = coins >= EXTRA_PACK_COST && !opening && !revealing;
   return (
     <div style={{ textAlign: "center" }}>
       {displayName && (
@@ -641,11 +812,11 @@ function HomeView({ packsLeft, canOpen, opening, openPack, packTheme, packFlash,
       <p style={{ color: "#c9c3e0", marginBottom: "28px" }}>
         {packsLeft > 0
           ? `Te quedan ${packsLeft} sobre${packsLeft === 1 ? "" : "s"} hoy`
-          : "Ya abriste todos tus sobres de hoy. Volvé mañana."}
+          : "Ya abriste todos tus sobres gratis de hoy."}
       </p>
 
       <div
-        onClick={openPack}
+        onClick={canOpen ? openPack : undefined}
         style={{
           width: "200px",
           height: "280px",
@@ -679,9 +850,32 @@ function HomeView({ packsLeft, canOpen, opening, openPack, packTheme, packFlash,
         {opening ? "Abriendo..." : canOpen ? "Abrir sobre" : packsLeft <= 0 ? "Sin sobres hoy" : "Cargando..."}
       </button>
 
+      <div style={{ marginTop: "18px" }}>
+        <button
+          onClick={buyExtraPack}
+          disabled={!canBuyExtra}
+          style={{
+            background: "transparent",
+            color: canBuyExtra ? "#ffd95e" : "#665f80",
+            border: `1px solid ${canBuyExtra ? "rgba(255,217,94,0.5)" : "rgba(255,255,255,0.12)"}`,
+            borderRadius: "999px",
+            padding: "10px 24px",
+            fontSize: "13px",
+            fontWeight: 600,
+            cursor: canBuyExtra ? "pointer" : "not-allowed",
+            display: "inline-flex",
+            alignItems: "center",
+            gap: "8px",
+          }}
+        >
+          <span>{String.fromCodePoint(0x1fa99)}</span>
+          Comprar sobre extra — {EXTRA_PACK_COST}
+        </button>
+      </div>
+
       <div
         style={{
-          marginTop: "40px",
+          marginTop: "32px",
           display: "inline-flex",
           gap: "24px",
           background: "rgba(255,255,255,0.05)",
@@ -712,16 +906,24 @@ function rarityColor(rarity) {
   return "#d8d4e8";
 }
 
-function CollectionView({ cards, collection, ownedUnique, totalUnique }) {
+function CollectionView({ cards, collection, ownedUnique, totalUnique, coins, onSell }) {
   const completion = totalUnique ? Math.round((ownedUnique / totalUnique) * 100) : 0;
   return (
     <div>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "20px" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "20px", flexWrap: "wrap", gap: "8px" }}>
         <h2 style={{ fontSize: "20px", fontWeight: 700, margin: 0 }}>Mi colección</h2>
-        <span style={{ color: "#c9c3e0", fontSize: "14px" }}>
-          {ownedUnique} / {totalUnique} cartas ({completion}%)
-        </span>
+        <div style={{ display: "flex", alignItems: "center", gap: "16px" }}>
+          <span style={{ color: "#ffd95e", fontSize: "13px", fontWeight: 700 }}>
+            {String.fromCodePoint(0x1fa99)} {coins}
+          </span>
+          <span style={{ color: "#c9c3e0", fontSize: "14px" }}>
+            {ownedUnique} / {totalUnique} cartas ({completion}%)
+          </span>
+        </div>
       </div>
+      <p style={{ color: "#8d87a8", fontSize: "12px", marginTop: "-8px", marginBottom: "18px" }}>
+        Podés vender las cartas que te sobren a cambio de monedas.
+      </p>
       <div
         style={{
           display: "grid",
@@ -731,6 +933,7 @@ function CollectionView({ cards, collection, ownedUnique, totalUnique }) {
       >
         {cards.map((card) => {
           const owned = collection[card.id] || 0;
+          const price = sellPriceFor(card.rarity);
           return (
             <div
               key={card.id}
@@ -766,6 +969,25 @@ function CollectionView({ cards, collection, ownedUnique, totalUnique }) {
                 <div style={{ fontSize: "11px", color: "#ffd95e", fontWeight: 700, marginTop: "2px" }}>
                   ×{owned}
                 </div>
+              )}
+              {owned > 0 && (
+                <button
+                  onClick={() => onSell(card.id)}
+                  style={{
+                    marginTop: "6px",
+                    width: "100%",
+                    background: "rgba(255,217,94,0.12)",
+                    color: "#ffd95e",
+                    border: "1px solid rgba(255,217,94,0.3)",
+                    borderRadius: "999px",
+                    padding: "4px 0",
+                    fontSize: "10px",
+                    fontWeight: 700,
+                    cursor: "pointer",
+                  }}
+                >
+                  Vender · {price} {String.fromCodePoint(0x1fa99)}
+                </button>
               )}
             </div>
           );
@@ -859,7 +1081,7 @@ function CardReveal({ card, revealKey, playTone }) {
 
 function RevealOverlay({ cards, revealIndex, onNext, onClose, playTone }) {
   const allRevealed = revealIndex >= cards.length - 1;
-  const current = revealIndex >= 0 ? cards[revealIndex] : null;
+  const current = cards[revealIndex] || cards[0];
 
   return (
     <div
@@ -878,72 +1100,46 @@ function RevealOverlay({ cards, revealIndex, onNext, onClose, playTone }) {
         overflow: "hidden",
       }}
     >
-      {revealIndex === -1 ? (
-        <div style={{ textAlign: "center", color: "#f4f1ea" }}>
-          <div style={{ fontSize: "20px", marginBottom: "20px" }}>Tocá para revelar tus cartas</div>
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              onNext();
-            }}
+      <CardReveal card={current} revealKey={`${current.id}-${revealIndex}`} playTone={playTone} />
+
+      <div style={{ marginTop: "28px", display: "flex", gap: "6px" }}>
+        {cards.map((_, i) => (
+          <div
+            key={i}
             style={{
-              background: "#ffd95e",
-              color: "#241b3d",
-              border: "none",
-              borderRadius: "999px",
-              padding: "12px 32px",
-              fontWeight: 700,
-              fontSize: "16px",
-              cursor: "pointer",
+              width: "8px",
+              height: "8px",
+              borderRadius: "50%",
+              background: i <= revealIndex ? "#ffd95e" : "rgba(255,255,255,0.25)",
             }}
-          >
-            Empezar
-          </button>
-        </div>
-      ) : (
-        <>
-          <CardReveal card={current} revealKey={`${current.id}-${revealIndex}`} playTone={playTone} />
+          />
+        ))}
+      </div>
 
-          <div style={{ marginTop: "28px", display: "flex", gap: "6px" }}>
-            {cards.map((_, i) => (
-              <div
-                key={i}
-                style={{
-                  width: "8px",
-                  height: "8px",
-                  borderRadius: "50%",
-                  background: i <= revealIndex ? "#ffd95e" : "rgba(255,255,255,0.25)",
-                }}
-              />
-            ))}
-          </div>
+      <div style={{ marginTop: "18px", fontSize: "13px", color: "#c9c3e0" }}>
+        {allRevealed ? "Listo, ya tenés todas tus cartas." : "Tocá la pantalla para ver la siguiente carta"}
+      </div>
 
-          <div style={{ marginTop: "18px", fontSize: "13px", color: "#c9c3e0" }}>
-            {allRevealed ? "Listo, ya tenés todas tus cartas." : "Tocá la pantalla para ver la siguiente carta"}
-          </div>
-
-          {allRevealed && (
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                onClose();
-              }}
-              style={{
-                marginTop: "20px",
-                background: "#ffd95e",
-                color: "#241b3d",
-                border: "none",
-                borderRadius: "999px",
-                padding: "12px 32px",
-                fontWeight: 700,
-                fontSize: "16px",
-                cursor: "pointer",
-              }}
-            >
-              Volver
-            </button>
-          )}
-        </>
+      {allRevealed && (
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onClose();
+          }}
+          style={{
+            marginTop: "20px",
+            background: "#ffd95e",
+            color: "#241b3d",
+            border: "none",
+            borderRadius: "999px",
+            padding: "12px 32px",
+            fontWeight: 700,
+            fontSize: "16px",
+            cursor: "pointer",
+          }}
+        >
+          Volver
+        </button>
       )}
     </div>
   );

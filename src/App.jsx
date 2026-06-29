@@ -18,7 +18,7 @@ function buildCards() {
   }));
 }
 
-const MAX_PACKS_PER_DAY = 3;
+const MAX_PACKS_PER_DAY = 4;
 const CARDS_PER_PACK = 6;
 const RARITY_WEIGHTS = {
   Common: 60,
@@ -58,9 +58,17 @@ function emptyUserDoc() {
 }
 
 function particleCountFor(rarity) {
-  if (rarity === "Rare Holo") return 28;
-  if (rarity === "Rare") return 16;
-  return 0;
+  if (rarity === "Rare Holo") return 32;
+  if (rarity === "Rare") return 20;
+  if (rarity === "Uncommon") return 10;
+  return 5;
+}
+
+function particleColorFor(rarity) {
+  if (rarity === "Rare Holo") return "#ffd95e";
+  if (rarity === "Rare") return "#9fd6ff";
+  if (rarity === "Uncommon") return "#a8e6a1";
+  return "#d8d4e8";
 }
 
 function ParticleBurst({ seed, count, color }) {
@@ -123,19 +131,112 @@ function ParticleBurst({ seed, count, color }) {
   );
 }
 
-function FlashOverlay({ active, color = "#fff" }) {
+function FlashOverlay({ active, color = "#fff", intensity = 0.85 }) {
   return (
     <div
       style={{
         position: "absolute",
         inset: 0,
         background: color,
-        opacity: active ? 0.85 : 0,
+        opacity: active ? intensity : 0,
         transition: active ? "opacity 0.08s ease" : "opacity 0.3s ease",
         pointerEvents: "none",
         borderRadius: "inherit",
       }}
     />
+  );
+}
+
+const PACK_THEMES = [
+  {
+    id: "fire",
+    label: "Llama",
+    gradient: "linear-gradient(160deg, #ff8a3d 0%, #e8424a 45%, #7a121d 100%)",
+    glow: "rgba(255,138,61,0.55)",
+    accent: "#ffd95e",
+  },
+  {
+    id: "water",
+    label: "Marea",
+    gradient: "linear-gradient(160deg, #5fc8e8 0%, #2f7fc9 45%, #123a6e 100%)",
+    glow: "rgba(95,200,232,0.55)",
+    accent: "#cdeeff",
+  },
+  {
+    id: "leaf",
+    label: "Follaje",
+    gradient: "linear-gradient(160deg, #8fe06a 0%, #3f9e4f 45%, #1c4d24 100%)",
+    glow: "rgba(143,224,106,0.5)",
+    accent: "#e8ffd0",
+  },
+];
+
+function pickRandomTheme(excludeId) {
+  const pool = excludeId ? PACK_THEMES.filter((t) => t.id !== excludeId) : PACK_THEMES;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+function PackArt({ theme, flash }) {
+  return (
+    <div
+      style={{
+        position: "relative",
+        width: "100%",
+        height: "100%",
+        borderRadius: "16px",
+        overflow: "hidden",
+        background: theme.gradient,
+      }}
+    >
+      <svg
+        viewBox="0 0 200 280"
+        style={{ position: "absolute", inset: 0, width: "100%", height: "100%", opacity: 0.5 }}
+      >
+        <circle cx="100" cy="95" r="70" fill="none" stroke={theme.accent} strokeWidth="2" opacity="0.35" />
+        <circle cx="100" cy="95" r="46" fill="none" stroke={theme.accent} strokeWidth="2" opacity="0.5" />
+        {theme.id === "fire" && (
+          <path
+            d="M100 50 C70 90 70 120 100 150 C130 120 130 90 100 50 Z M100 75 C90 95 90 110 100 125 C110 110 110 95 100 75 Z"
+            fill={theme.accent}
+            opacity="0.85"
+          />
+        )}
+        {theme.id === "water" && (
+          <path d="M100 50 C60 95 60 130 100 150 C140 130 140 95 100 50 Z" fill={theme.accent} opacity="0.8" />
+        )}
+        {theme.id === "leaf" && (
+          <g fill={theme.accent} opacity="0.85">
+            <path d="M100 55 C75 70 70 105 100 145 C130 105 125 70 100 55 Z" />
+            <path d="M100 80 L100 145" stroke="#1c4d24" strokeWidth="3" opacity="0.4" fill="none" />
+          </g>
+        )}
+        {Array.from({ length: 6 }).map((_, i) => (
+          <circle key={i} cx={30 + i * 30} cy={220 + (i % 2) * 20} r="3" fill={theme.accent} opacity="0.4" />
+        ))}
+      </svg>
+
+      <div
+        style={{
+          position: "absolute",
+          inset: 0,
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+          color: "#fff",
+        }}
+      >
+        <div style={{ fontWeight: 700, fontSize: "19px", letterSpacing: "2px", textShadow: "0 2px 8px rgba(0,0,0,0.4)" }}>
+          BASE SET
+        </div>
+        <div style={{ fontSize: "11px", opacity: 0.85, marginTop: "6px", letterSpacing: "1px" }}>
+          {theme.label.toUpperCase()}
+        </div>
+        <div style={{ fontSize: "11px", opacity: 0.7, marginTop: "10px" }}>6 cartas</div>
+      </div>
+
+      <FlashOverlay active={flash} color={theme.accent} />
+    </div>
   );
 }
 
@@ -152,9 +253,9 @@ export default function PokeSobres() {
   const [revealing, setRevealing] = useState(false);
   const [revealedCards, setRevealedCards] = useState([]);
   const [revealIndex, setRevealIndex] = useState(-1);
-  const [packShaking, setPackShaking] = useState(false);
   const [packFlash, setPackFlash] = useState(false);
   const [opening, setOpening] = useState(false);
+  const [packTheme, setPackTheme] = useState(() => pickRandomTheme());
   const audioCtxRef = useRef(null);
 
   useEffect(() => {
@@ -248,8 +349,8 @@ export default function PokeSobres() {
   const openPack = useCallback(async () => {
     if (!canOpen || !user) return;
     setOpening(true);
-    setPackShaking(true);
-    playTone(220, 0.15, "triangle", 0.04);
+    setPackFlash(true);
+    playTone(440, 0.18, "sine", 0.06);
 
     // Sorteo de cartas en el cliente
     const commons = cards.filter((c) => c.rarity === "Common");
@@ -294,19 +395,15 @@ export default function PokeSobres() {
       setOpensToday(result.opensToday);
       setProfile(result);
       setTimeout(() => {
-        setPackFlash(true);
-        playTone(440, 0.2, "sine", 0.05);
-        setTimeout(() => {
-          setRevealedCards(pulled);
-          setRevealIndex(-1);
-          setPackShaking(false);
-          setPackFlash(false);
-          setRevealing(true);
-          setOpening(false);
-        }, 130);
-      }, 500);
+        setRevealedCards(pulled);
+        setRevealIndex(-1);
+        setPackFlash(false);
+        setRevealing(true);
+        setOpening(false);
+        setPackTheme((prevTheme) => pickRandomTheme(prevTheme.id));
+      }, 150);
     } catch (err) {
-      setPackShaking(false);
+      setPackFlash(false);
       setOpening(false);
       if (err.message === "LIMIT_REACHED") {
         setOpensToday(MAX_PACKS_PER_DAY);
@@ -440,7 +537,7 @@ export default function PokeSobres() {
             canOpen={canOpen}
             opening={opening}
             openPack={openPack}
-            packShaking={packShaking}
+            packTheme={packTheme}
             packFlash={packFlash}
             completion={completion}
             ownedUnique={ownedUnique}
@@ -534,7 +631,7 @@ function ErrorScreen() {
   );
 }
 
-function HomeView({ packsLeft, canOpen, opening, openPack, packShaking, packFlash, completion, ownedUnique, totalUnique, displayName }) {
+function HomeView({ packsLeft, canOpen, opening, openPack, packTheme, packFlash, completion, ownedUnique, totalUnique, displayName }) {
   return (
     <div style={{ textAlign: "center" }}>
       {displayName && (
@@ -550,31 +647,19 @@ function HomeView({ packsLeft, canOpen, opening, openPack, packShaking, packFlas
       <div
         onClick={openPack}
         style={{
-          position: "relative",
           width: "200px",
           height: "280px",
           margin: "0 auto 28px",
           borderRadius: "16px",
-          overflow: "hidden",
-          background: "linear-gradient(145deg, #e8424a 0%, #b21f2d 55%, #7a121d 100%)",
-          border: "3px solid #ffd95e",
-          display: "flex",
-          flexDirection: "column",
-          alignItems: "center",
-          justifyContent: "center",
+          border: `3px solid ${packTheme.accent}`,
           cursor: canOpen ? "pointer" : "not-allowed",
           opacity: canOpen ? 1 : 0.45,
-          transform: packShaking ? "rotate(-3deg) scale(1.06)" : "none",
-          transition: packShaking ? "transform 0.09s ease-in-out" : "transform 0.2s ease",
-          boxShadow: packShaking
-            ? "0 0 40px 6px rgba(255,217,94,0.5), 0 12px 30px rgba(0,0,0,0.4)"
-            : "0 12px 30px rgba(0,0,0,0.4)",
+          transform: opening ? "scale(0.94)" : "scale(1)",
+          transition: "transform 0.12s ease",
+          boxShadow: `0 0 30px 4px ${packTheme.glow}, 0 12px 30px rgba(0,0,0,0.4)`,
         }}
       >
-        <div style={{ fontSize: "44px", marginBottom: "10px" }}>{String.fromCodePoint(0x1f525)}</div>
-        <div style={{ fontWeight: 700, fontSize: "18px", color: "#ffe9a8", letterSpacing: "1px" }}>BASE SET</div>
-        <div style={{ fontSize: "12px", color: "#ffd0d0", marginTop: "6px" }}>6 cartas</div>
-        <FlashOverlay active={packFlash} />
+        <PackArt theme={packTheme} flash={packFlash} />
       </div>
 
       <button
@@ -693,17 +778,26 @@ function CollectionView({ cards, collection, ownedUnique, totalUnique }) {
 function CardReveal({ card, revealKey, playTone }) {
   const [stage, setStage] = useState("flash"); // flash -> popping -> settled
   const isBig = card.rarity === "Rare Holo" || card.rarity === "Rare";
-  const particleColor = card.rarity === "Rare Holo" ? "#ffd95e" : "#9fd6ff";
+  const particleColor = particleColorFor(card.rarity);
 
   useEffect(() => {
     setStage("flash");
-    const t1 = setTimeout(() => setStage("popping"), isBig ? 130 : 30);
-    const t2 = setTimeout(() => setStage("settled"), isBig ? 600 : 350);
+    const t1 = setTimeout(() => setStage("popping"), isBig ? 130 : 50);
+    const t2 = setTimeout(() => setStage("settled"), isBig ? 600 : 380);
     return () => {
       clearTimeout(t1);
       clearTimeout(t2);
     };
   }, [revealKey, isBig]);
+
+  const popTransform =
+    stage === "flash"
+      ? "scale(0.2) rotate(-8deg)"
+      : stage === "popping"
+      ? isBig
+        ? "scale(1.18) rotate(2deg)"
+        : "scale(1.08) rotate(-1deg)"
+      : "scale(1) rotate(0deg)";
 
   return (
     <div
@@ -713,26 +807,19 @@ function CardReveal({ card, revealKey, playTone }) {
         textAlign: "center",
       }}
     >
-      <FlashOverlay active={stage === "flash" && isBig} color={particleColor} />
+      <FlashOverlay active={stage === "flash"} color={particleColor} intensity={isBig ? 0.85 : 0.35} />
       {stage !== "flash" && <ParticleBurst seed={revealKey} count={particleCountFor(card.rarity)} color={particleColor} />}
 
       <div
         style={{
-          transform:
-            stage === "flash"
-              ? "scale(0.25)"
-              : stage === "popping"
-              ? isBig
-                ? "scale(1.15)"
-                : "scale(1.03)"
-              : "scale(1)",
+          transform: popTransform,
           opacity: stage === "flash" ? 0 : 1,
           transition:
             stage === "flash"
               ? "none"
               : stage === "popping"
-              ? `transform ${isBig ? 0.4 : 0.22}s cubic-bezier(0.17, 0.89, 0.32, 1.49), opacity 0.2s ease`
-              : "transform 0.25s ease",
+              ? `transform ${isBig ? 0.4 : 0.28}s cubic-bezier(0.17, 0.89, 0.32, 1.49), opacity 0.2s ease`
+              : "transform 0.3s cubic-bezier(0.34, 1.2, 0.4, 1)",
         }}
       >
         <img

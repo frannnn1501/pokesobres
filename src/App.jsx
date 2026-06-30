@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback, useRef } from "react";
 import { BASE1_CARDS } from "./base1data";
 import { auth, db, googleProvider } from "./firebase";
 import { signInWithPopup, signOut, onAuthStateChanged } from "firebase/auth";
-import { doc, getDoc, setDoc, runTransaction } from "firebase/firestore";
+import { doc, getDoc, setDoc, updateDoc, runTransaction, collection, query, where, getDocs, addDoc, onSnapshot } from "firebase/firestore";
 
 function buildCards() {
   return BASE1_CARDS.map(([number, name, rarity]) => ({
@@ -58,11 +58,17 @@ function rarityRank(rarity) {
 function emptyUserDoc() {
   return {
     displayName: "",
+    username: "",
     lastOpenDate: todayStr(),
     opensToday: 0,
     collection: {},
     coins: 0,
+    friends: {},
   };
+}
+
+function isValidUsername(name) {
+  return /^[a-z0-9_]{3,20}$/.test(name);
 }
 
 function drawPack(cards) {
@@ -274,6 +280,14 @@ export default function PokeSobres() {
   const [collection, setCollection] = useState({});
   const [opensToday, setOpensToday] = useState(0);
   const [coins, setCoins] = useState(0);
+  const [username, setUsername] = useState("");
+  const [needsUsername, setNeedsUsername] = useState(false);
+  const [usernameError, setUsernameError] = useState("");
+  const [usernameSaving, setUsernameSaving] = useState(false);
+  const [friends, setFriends] = useState({});
+  const [friendRequests, setFriendRequests] = useState([]);
+  const [friendProfiles, setFriendProfiles] = useState({});
+  const [viewingFriendUid, setViewingFriendUid] = useState(null);
   const [view, setView] = useState("home");
   const [revealing, setRevealing] = useState(false);
   const [revealedCards, setRevealedCards] = useState([]);
@@ -299,6 +313,9 @@ export default function PokeSobres() {
         setCollection({});
         setOpensToday(0);
         setCoins(0);
+        setUsername("");
+        setFriends({});
+        setNeedsUsername(false);
       }
     });
     return () => unsub();
@@ -332,6 +349,9 @@ export default function PokeSobres() {
       setProfile(data);
       setCollection(data.collection || {});
       setCoins(data.coins || 0);
+      setUsername(data.username || "");
+      setFriends(data.friends || {});
+      setNeedsUsername(!data.username);
     } catch (err) {
       setAuthError("No se pudo cargar tu perfil. Probá recargar la página.");
     }
@@ -351,6 +371,115 @@ export default function PokeSobres() {
     setView("home");
   }, []);
 
+  const claimUsername = useCallback(
+    async (rawName) => {
+      if (!user) return;
+      const name = rawName.trim().toLowerCase();
+      setUsernameError("");
+
+      if (!isValidUsername(name)) {
+        setUsernameError("Usá entre 3 y 20 letras minúsculas, números o guion bajo.");
+        return;
+      }
+
+      setUsernameSaving(true);
+      const usernameRef = doc(db, "usernames", name);
+      const userRef = doc(db, "users", user.uid);
+      try {
+        await runTransaction(db, async (tx) => {
+          const usernameSnap = await tx.get(usernameRef);
+          if (usernameSnap.exists()) {
+            throw new Error("TAKEN");
+          }
+          const userSnap = await tx.get(userRef);
+          const data = userSnap.exists() ? userSnap.data() : emptyUserDoc();
+          tx.set(usernameRef, { uid: user.uid });
+          tx.set(userRef, { ...data, username: name });
+        });
+        setUsername(name);
+        setNeedsUsername(false);
+        setProfile((p) => ({ ...(p || {}), username: name }));
+      } catch (err) {
+        if (err.message === "TAKEN") {
+          setUsernameError("Ese nombre de usuario ya está en uso. Probá otro.");
+        } else {
+          setUsernameError("No se pudo guardar. Probá de nuevo.");
+        }
+      } finally {
+        setUsernameSaving(false);
+      }
+    },
+    [user]
+  );
+
+  const sendFriendRequest = useCallback(
+    async (targetUsername) => {
+      if (!user || !username) return { ok: false, message: "Necesitás tener tu propio username primero." };
+      const name = targetUsername.trim().toLowerCase();
+      if (!name) return { ok: false, message: "Escribí un nombre de usuario." };
+      if (name === username) return { ok: false, message: "No podés agregarte a vos mismo." };
+
+      try {
+        const usernameSnap = await getDoc(doc(db, "usernames", name));
+        if (!usernameSnap.exists()) {
+          return { ok: false, message: "No existe ningún usuario con ese nombre." };
+        }
+        const targetUid = usernameSnap.data().uid;
+        if (friends[targetUid]) {
+          return { ok: false, message: "Ya son amigos." };
+        }
+
+        const existingQuery = query(
+          collection(db, "friendRequests"),
+          where("fromUid", "==", user.uid),
+          where("toUid", "==", targetUid),
+          where("status", "==", "pending")
+        );
+        const existing = await getDocs(existingQuery);
+        if (!existing.empty) {
+          return { ok: false, message: "Ya le mandaste una solicitud, esperá a que responda." };
+        }
+
+        await addDoc(collection(db, "friendRequests"), {
+          fromUid: user.uid,
+          fromUsername: username,
+          toUid: targetUid,
+          toUsername: name,
+          status: "pending",
+          createdAt: todayStr(),
+        });
+        return { ok: true, message: `Solicitud enviada a ${name}.` };
+      } catch (err) {
+        return { ok: false, message: "No se pudo enviar la solicitud. Probá de nuevo." };
+      }
+    },
+    [user, username, friends]
+  );
+
+  const respondFriendRequest = useCallback(
+    async (request, accept) => {
+      if (!user) return;
+      const reqRef = doc(db, "friendRequests", request.id);
+      const myRef = doc(db, "users", user.uid);
+      try {
+        if (accept) {
+          await runTransaction(db, async (tx) => {
+            const mySnap = await tx.get(myRef);
+            const myData = mySnap.exists() ? mySnap.data() : emptyUserDoc();
+            tx.update(myRef, { friends: { ...(myData.friends || {}), [request.fromUid]: true } });
+            tx.update(reqRef, { status: "accepted" });
+          });
+          setFriends((f) => ({ ...f, [request.fromUid]: true }));
+        } else {
+          await updateDoc(reqRef, { status: "rejected" });
+        }
+      } catch (err) {
+        setAuthError("No se pudo procesar la solicitud. Probá de nuevo.");
+      }
+    },
+    [user]
+  );
+
   const playTone = useCallback((freq, dur, type = "sine", vol = 0.05) => {
     try {
       if (!audioCtxRef.current) {
@@ -369,6 +498,87 @@ export default function PokeSobres() {
       osc.stop(ctx.currentTime + dur);
     } catch {}
   }, []);
+
+  // Escuchar solicitudes de amistad pendientes dirigidas a mí, en tiempo real
+  useEffect(() => {
+    if (!user) {
+      setFriendRequests([]);
+      return;
+    }
+    const q = query(
+      collection(db, "friendRequests"),
+      where("toUid", "==", user.uid),
+      where("status", "==", "pending")
+    );
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        setFriendRequests(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+      },
+      () => {}
+    );
+    return () => unsub();
+  }, [user]);
+
+  // Escuchar mis propias solicitudes que ya fueron aceptadas, para completar
+  // la amistad de mi lado también (el que las acepta solo actualiza su documento).
+  useEffect(() => {
+    if (!user) return;
+    const q = query(
+      collection(db, "friendRequests"),
+      where("fromUid", "==", user.uid),
+      where("status", "==", "accepted")
+    );
+    const unsub = onSnapshot(
+      q,
+      async (snap) => {
+        for (const docSnap of snap.docs) {
+          const req = docSnap.data();
+          if (!friends[req.toUid]) {
+            try {
+              const myRef = doc(db, "users", user.uid);
+              const mySnap = await getDoc(myRef);
+              const myData = mySnap.exists() ? mySnap.data() : emptyUserDoc();
+              if (!myData.friends || !myData.friends[req.toUid]) {
+                await updateDoc(myRef, { friends: { ...(myData.friends || {}), [req.toUid]: true } });
+                setFriends((f) => ({ ...f, [req.toUid]: true }));
+              }
+            } catch {}
+          }
+        }
+      },
+      () => {}
+    );
+    return () => unsub();
+  }, [user, friends]);
+
+  // Cargar los perfiles públicos básicos de mis amigos (nombre, colección) para la lista
+  useEffect(() => {
+    const uids = Object.keys(friends || {});
+    if (uids.length === 0) {
+      setFriendProfiles({});
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      const entries = await Promise.all(
+        uids.map(async (uid) => {
+          try {
+            const snap = await getDoc(doc(db, "users", uid));
+            return [uid, snap.exists() ? snap.data() : null];
+          } catch {
+            return [uid, null];
+          }
+        })
+      );
+      if (!cancelled) {
+        setFriendProfiles(Object.fromEntries(entries));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [friends]);
 
   const packsLeft = MAX_PACKS_PER_DAY - opensToday;
   const canOpen = user && packsLeft > 0 && loadState === "ready" && !revealing && !opening;
@@ -651,6 +861,37 @@ export default function PokeSobres() {
               Mi colección
             </button>
             <button
+              style={{ ...styles.navBtn(view === "friends"), position: "relative" }}
+              onClick={() => {
+                setView("friends");
+                setViewingFriendUid(null);
+              }}
+            >
+              Amigos
+              {friendRequests.length > 0 && (
+                <span
+                  style={{
+                    position: "absolute",
+                    top: "-4px",
+                    right: "-4px",
+                    background: "#e8424a",
+                    color: "#fff",
+                    borderRadius: "999px",
+                    fontSize: "10px",
+                    fontWeight: 700,
+                    minWidth: "16px",
+                    height: "16px",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    padding: "0 3px",
+                  }}
+                >
+                  {friendRequests.length}
+                </span>
+              )}
+            </button>
+            <button
               onClick={logout}
               style={{
                 background: "transparent",
@@ -677,7 +918,10 @@ export default function PokeSobres() {
         )}
         {!authChecked && <LoadingScreen />}
         {authChecked && !user && <LoginScreen onLogin={loginWithGoogle} />}
-        {authChecked && user && loadState === "ready" && view === "home" && (
+        {authChecked && user && needsUsername && (
+          <UsernameScreen onSubmit={claimUsername} error={usernameError} saving={usernameSaving} />
+        )}
+        {authChecked && user && !needsUsername && loadState === "ready" && view === "home" && (
           <HomeView
             packsLeft={packsLeft}
             canOpen={canOpen}
@@ -694,7 +938,7 @@ export default function PokeSobres() {
             revealing={revealing}
           />
         )}
-        {authChecked && user && loadState === "ready" && view === "collection" && (
+        {authChecked && user && !needsUsername && loadState === "ready" && view === "collection" && (
           <CollectionView
             cards={cards}
             collection={collection}
@@ -702,6 +946,24 @@ export default function PokeSobres() {
             totalUnique={totalUnique}
             coins={coins}
             onSell={sellCard}
+          />
+        )}
+        {authChecked && user && !needsUsername && loadState === "ready" && view === "friends" && !viewingFriendUid && (
+          <FriendsView
+            username={username}
+            friends={friends}
+            friendProfiles={friendProfiles}
+            friendRequests={friendRequests}
+            onSendRequest={sendFriendRequest}
+            onRespond={respondFriendRequest}
+            onViewFriend={setViewingFriendUid}
+          />
+        )}
+        {authChecked && user && !needsUsername && loadState === "ready" && view === "friends" && viewingFriendUid && (
+          <FriendCollectionView
+            cards={cards}
+            friendProfile={friendProfiles[viewingFriendUid]}
+            onBack={() => setViewingFriendUid(null)}
           />
         )}
       </div>
@@ -763,6 +1025,326 @@ function LoginScreen({ onLogin }) {
         </svg>
         Iniciar sesión con Google
       </button>
+    </div>
+  );
+}
+
+function UsernameScreen({ onSubmit, error, saving }) {
+  const [value, setValue] = useState("");
+  return (
+    <div style={{ textAlign: "center", padding: "60px 20px", maxWidth: "360px", margin: "0 auto" }}>
+      <div style={{ fontSize: "44px", marginBottom: "12px" }}>{String.fromCodePoint(0x1f3ae)}</div>
+      <h1 style={{ fontSize: "22px", fontWeight: 700, marginBottom: "8px" }}>Elegí tu nombre de usuario</h1>
+      <p style={{ color: "#c9c3e0", fontSize: "13px", marginBottom: "24px" }}>
+        Tus amigos te van a poder buscar por este nombre. Solo letras minúsculas, números y guion bajo (3-20
+        caracteres).
+      </p>
+      <input
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && !saving) onSubmit(value);
+        }}
+        placeholder="ej: fran_tcg"
+        style={{
+          width: "100%",
+          background: "rgba(255,255,255,0.06)",
+          border: "1px solid rgba(255,255,255,0.2)",
+          borderRadius: "10px",
+          padding: "12px 16px",
+          color: "#f4f1ea",
+          fontSize: "15px",
+          marginBottom: "12px",
+          boxSizing: "border-box",
+          textAlign: "center",
+        }}
+      />
+      {error && <p style={{ color: "#f0a0a0", fontSize: "13px", marginBottom: "12px" }}>{error}</p>}
+      <button
+        onClick={() => onSubmit(value)}
+        disabled={saving || !value.trim()}
+        style={{
+          background: saving || !value.trim() ? "rgba(255,255,255,0.1)" : "#ffd95e",
+          color: saving || !value.trim() ? "#888" : "#241b3d",
+          border: "none",
+          borderRadius: "999px",
+          padding: "12px 32px",
+          fontSize: "15px",
+          fontWeight: 700,
+          cursor: saving || !value.trim() ? "not-allowed" : "pointer",
+          width: "100%",
+        }}
+      >
+        {saving ? "Guardando..." : "Confirmar"}
+      </button>
+    </div>
+  );
+}
+
+function FriendsView({ username, friends, friendProfiles, friendRequests, onSendRequest, onRespond, onViewFriend }) {
+  const [searchValue, setSearchValue] = useState("");
+  const [searchStatus, setSearchStatus] = useState(null);
+  const [sending, setSending] = useState(false);
+  const friendUids = Object.keys(friends || {});
+
+  const handleSend = async () => {
+    if (!searchValue.trim() || sending) return;
+    setSending(true);
+    setSearchStatus(null);
+    const result = await onSendRequest(searchValue);
+    setSearchStatus(result);
+    setSending(false);
+    if (result.ok) setSearchValue("");
+  };
+
+  return (
+    <div>
+      <div style={{ marginBottom: "8px" }}>
+        <h2 style={{ fontSize: "20px", fontWeight: 700, margin: 0 }}>Amigos</h2>
+        <p style={{ color: "#8d87a8", fontSize: "12px", marginTop: "4px" }}>
+          Tu nombre de usuario es <strong style={{ color: "#ffd95e" }}>{username}</strong>
+        </p>
+      </div>
+
+      <div
+        style={{
+          display: "flex",
+          gap: "8px",
+          marginTop: "20px",
+          marginBottom: "8px",
+        }}
+      >
+        <input
+          value={searchValue}
+          onChange={(e) => setSearchValue(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") handleSend();
+          }}
+          placeholder="Nombre de usuario de tu amigo"
+          style={{
+            flex: 1,
+            background: "rgba(255,255,255,0.06)",
+            border: "1px solid rgba(255,255,255,0.2)",
+            borderRadius: "10px",
+            padding: "10px 14px",
+            color: "#f4f1ea",
+            fontSize: "14px",
+          }}
+        />
+        <button
+          onClick={handleSend}
+          disabled={sending}
+          style={{
+            background: "#ffd95e",
+            color: "#241b3d",
+            border: "none",
+            borderRadius: "10px",
+            padding: "10px 20px",
+            fontWeight: 700,
+            fontSize: "14px",
+            cursor: sending ? "not-allowed" : "pointer",
+            opacity: sending ? 0.6 : 1,
+          }}
+        >
+          Agregar
+        </button>
+      </div>
+      {searchStatus && (
+        <p style={{ fontSize: "13px", color: searchStatus.ok ? "#a8e6a1" : "#f0a0a0", marginBottom: "20px" }}>
+          {searchStatus.message}
+        </p>
+      )}
+
+      {friendRequests.length > 0 && (
+        <div style={{ marginTop: "20px", marginBottom: "28px" }}>
+          <h3 style={{ fontSize: "14px", color: "#c9c3e0", marginBottom: "10px" }}>Solicitudes pendientes</h3>
+          {friendRequests.map((req) => (
+            <div
+              key={req.id}
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                background: "rgba(255,255,255,0.05)",
+                borderRadius: "10px",
+                padding: "10px 14px",
+                marginBottom: "8px",
+              }}
+            >
+              <span style={{ fontSize: "14px" }}>{req.fromUsername}</span>
+              <div style={{ display: "flex", gap: "6px" }}>
+                <button
+                  onClick={() => onRespond(req, true)}
+                  style={{
+                    background: "#a8e6a1",
+                    color: "#1c4d24",
+                    border: "none",
+                    borderRadius: "999px",
+                    padding: "6px 14px",
+                    fontSize: "12px",
+                    fontWeight: 700,
+                    cursor: "pointer",
+                  }}
+                >
+                  Aceptar
+                </button>
+                <button
+                  onClick={() => onRespond(req, false)}
+                  style={{
+                    background: "transparent",
+                    color: "#c9c3e0",
+                    border: "1px solid rgba(255,255,255,0.2)",
+                    borderRadius: "999px",
+                    padding: "6px 14px",
+                    fontSize: "12px",
+                    cursor: "pointer",
+                  }}
+                >
+                  Rechazar
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <h3 style={{ fontSize: "14px", color: "#c9c3e0", marginBottom: "10px" }}>
+        Tus amigos {friendUids.length > 0 && `(${friendUids.length})`}
+      </h3>
+      {friendUids.length === 0 ? (
+        <p style={{ color: "#8d87a8", fontSize: "13px" }}>Todavía no agregaste a nadie.</p>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+          {friendUids.map((uid) => {
+            const fp = friendProfiles[uid];
+            const ownedCount = fp ? Object.keys(fp.collection || {}).length : null;
+            return (
+              <div
+                key={uid}
+                onClick={() => onViewFriend(uid)}
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  background: "rgba(255,255,255,0.05)",
+                  borderRadius: "10px",
+                  padding: "12px 16px",
+                  cursor: "pointer",
+                }}
+              >
+                <span style={{ fontWeight: 600 }}>{fp ? fp.username || fp.displayName : "Cargando..."}</span>
+                <span style={{ fontSize: "12px", color: "#c9c3e0" }}>
+                  {ownedCount !== null ? `${ownedCount} cartas` : ""}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FriendCollectionView({ cards, friendProfile, onBack }) {
+  if (!friendProfile) {
+    return (
+      <div style={{ textAlign: "center", padding: "40px 0", color: "#c9c3e0" }}>
+        <p>Cargando colección...</p>
+        <button
+          onClick={onBack}
+          style={{
+            marginTop: "16px",
+            background: "transparent",
+            color: "#c9c3e0",
+            border: "1px solid rgba(255,255,255,0.2)",
+            borderRadius: "999px",
+            padding: "8px 18px",
+            cursor: "pointer",
+          }}
+        >
+          Volver
+        </button>
+      </div>
+    );
+  }
+
+  const friendCollection = friendProfile.collection || {};
+  const ownedUnique = Object.keys(friendCollection).length;
+  const totalUnique = cards.length;
+  const completion = totalUnique ? Math.round((ownedUnique / totalUnique) * 100) : 0;
+
+  return (
+    <div>
+      <button
+        onClick={onBack}
+        style={{
+          background: "transparent",
+          color: "#c9c3e0",
+          border: "1px solid rgba(255,255,255,0.2)",
+          borderRadius: "999px",
+          padding: "6px 16px",
+          fontSize: "13px",
+          cursor: "pointer",
+          marginBottom: "16px",
+        }}
+      >
+        ← Volver a amigos
+      </button>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "20px" }}>
+        <h2 style={{ fontSize: "20px", fontWeight: 700, margin: 0 }}>
+          Colección de {friendProfile.username || friendProfile.displayName}
+        </h2>
+        <span style={{ color: "#c9c3e0", fontSize: "14px" }}>
+          {ownedUnique} / {totalUnique} cartas ({completion}%)
+        </span>
+      </div>
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(auto-fill, minmax(110px, 1fr))",
+          gap: "14px",
+        }}
+      >
+        {cards.map((card) => {
+          const owned = friendCollection[card.id] || 0;
+          return (
+            <div
+              key={card.id}
+              style={{
+                background: "rgba(255,255,255,0.04)",
+                borderRadius: "10px",
+                padding: "8px",
+                textAlign: "center",
+                opacity: owned ? 1 : 0.28,
+                border: owned ? `1px solid ${rarityColor(card.rarity)}55` : "1px solid transparent",
+              }}
+            >
+              <img
+                src={card.images.small}
+                alt={card.name}
+                onError={(e) => {
+                  e.target.onerror = null;
+                  e.target.src =
+                    "data:image/svg+xml;utf8," +
+                    encodeURIComponent(
+                      '<svg xmlns="http://www.w3.org/2000/svg" width="100" height="140"><rect width="100" height="140" fill="#352a55"/><text x="50" y="74" font-size="11" fill="#c9c3e0" text-anchor="middle">sin imagen</text></svg>'
+                    );
+                }}
+                style={{
+                  width: "100%",
+                  borderRadius: "6px",
+                  filter: owned ? "none" : "grayscale(1)",
+                  marginBottom: "6px",
+                }}
+              />
+              <div style={{ fontSize: "11px", fontWeight: 600, lineHeight: 1.2 }}>{card.name}</div>
+              {owned > 1 && (
+                <div style={{ fontSize: "11px", color: "#ffd95e", fontWeight: 700, marginTop: "2px" }}>×{owned}</div>
+              )}
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }

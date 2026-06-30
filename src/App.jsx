@@ -303,6 +303,9 @@ export default function PokeSobres() {
   const [viewingFriendUid, setViewingFriendUid] = useState(null);
   const [listings, setListings] = useState([]);
   const [marketError, setMarketError] = useState("");
+  const [incomingTrades, setIncomingTrades] = useState([]);
+  const [outgoingTrades, setOutgoingTrades] = useState([]);
+  const [tradeError, setTradeError] = useState("");
   const [view, setView] = useState("home");
   const [revealing, setRevealing] = useState(false);
   const [revealedCards, setRevealedCards] = useState([]);
@@ -577,6 +580,194 @@ export default function PokeSobres() {
       setListings(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
     }, () => {});
     return () => unsub();
+  }, []);
+
+  // Trades que me proponen a mí, pendientes
+  useEffect(() => {
+    if (!user) { setIncomingTrades([]); return; }
+    const q = query(
+      fsCollection(db, "trades"),
+      where("toUid", "==", user.uid),
+      where("status", "==", "pending")
+    );
+    const unsub = onSnapshot(q, (snap) => {
+      setIncomingTrades(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+    }, () => {});
+    return () => unsub();
+  }, [user]);
+
+  // Trades que yo propuse, pendientes (para poder cancelarlas)
+  useEffect(() => {
+    if (!user) { setOutgoingTrades([]); return; }
+    const q = query(
+      fsCollection(db, "trades"),
+      where("fromUid", "==", user.uid),
+      where("status", "==", "pending")
+    );
+    const unsub = onSnapshot(q, (snap) => {
+      setOutgoingTrades(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+    }, () => {});
+    return () => unsub();
+  }, [user]);
+
+  // Mis propios trades que ya fueron aceptados por el otro: tengo que aplicar
+  // mi parte del intercambio (igual que con las solicitudes de amistad).
+  useEffect(() => {
+    if (!user) return;
+    const q = query(
+      fsCollection(db, "trades"),
+      where("fromUid", "==", user.uid),
+      where("status", "==", "accepted")
+    );
+    const unsub = onSnapshot(q, async (snap) => {
+      for (const docSnap of snap.docs) {
+        const trade = docSnap.data();
+        if (trade.fromApplied) continue;
+        try {
+          const myRef = doc(db, "users", user.uid);
+          await runTransaction(db, async (tx) => {
+            const mySnap = await tx.get(myRef);
+            const myData = mySnap.exists() ? mySnap.data() : emptyUserDoc();
+            const newCollection = { ...(myData.collection || {}) };
+            // Pierdo lo que ofrecí
+            for (const [cardId, qty] of Object.entries(trade.offerCards || {})) {
+              newCollection[cardId] = (newCollection[cardId] || 0) - qty;
+              if (newCollection[cardId] <= 0) delete newCollection[cardId];
+            }
+            // Gano lo que pedí
+            for (const [cardId, qty] of Object.entries(trade.requestCards || {})) {
+              newCollection[cardId] = (newCollection[cardId] || 0) + qty;
+            }
+            const newCoins = (myData.coins || 0) - (trade.offerCoins || 0) + (trade.requestCoins || 0);
+            tx.update(myRef, { collection: newCollection, coins: newCoins });
+            tx.update(doc(db, "trades", docSnap.id), { fromApplied: true });
+          });
+          setCollection((prev) => {
+            const next = { ...prev };
+            for (const [cardId, qty] of Object.entries(trade.offerCards || {})) {
+              next[cardId] = (next[cardId] || 0) - qty;
+              if (next[cardId] <= 0) delete next[cardId];
+            }
+            for (const [cardId, qty] of Object.entries(trade.requestCards || {})) {
+              next[cardId] = (next[cardId] || 0) + qty;
+            }
+            return next;
+          });
+          setCoins((c) => c - (trade.offerCoins || 0) + (trade.requestCoins || 0));
+        } catch {}
+      }
+    }, () => {});
+    return () => unsub();
+  }, [user]);
+
+  const proposeTrade = useCallback(
+    async (toUsername, offerCards, offerCoins, requestCards, requestCoins) => {
+      if (!user || !username) return { ok: false, message: "Necesitás tu propio username primero." };
+      const targetName = toUsername.trim().toLowerCase();
+      if (!targetName) return { ok: false, message: "Elegí un amigo." };
+      if (targetName === username) return { ok: false, message: "No podés tradear con vos mismo." };
+
+      const hasOffer = Object.keys(offerCards).length > 0 || offerCoins > 0;
+      const hasRequest = Object.keys(requestCards).length > 0 || requestCoins > 0;
+      if (!hasOffer && !hasRequest) return { ok: false, message: "Agregá algo para ofrecer o pedir." };
+
+      // Verificar que tengo las cartas y monedas que ofrezco
+      for (const [cardId, qty] of Object.entries(offerCards)) {
+        if ((collection[cardId] || 0) < qty) return { ok: false, message: "No tenés suficientes copias de esa carta." };
+      }
+      if (offerCoins > coins) return { ok: false, message: "No tenés suficientes monedas para ofrecer." };
+
+      try {
+        const usernameSnap = await getDoc(doc(db, "usernames", targetName));
+        if (!usernameSnap.exists()) return { ok: false, message: "No existe ningún usuario con ese nombre." };
+        const targetUid = usernameSnap.data().uid;
+        if (!friends[targetUid]) return { ok: false, message: "Solo podés tradear con tus amigos." };
+
+        await addDoc(fsCollection(db, "trades"), {
+          fromUid: user.uid,
+          fromUsername: username,
+          toUid: targetUid,
+          toUsername: targetName,
+          offerCards,
+          offerCoins: offerCoins || 0,
+          requestCards,
+          requestCoins: requestCoins || 0,
+          status: "pending",
+          fromApplied: false,
+          createdAt: todayStr(),
+        });
+        return { ok: true, message: `Propuesta enviada a ${targetName}.` };
+      } catch (err) {
+        return { ok: false, message: "No se pudo enviar la propuesta. Probá de nuevo." };
+      }
+    },
+    [user, username, collection, coins, friends]
+  );
+
+  const respondTrade = useCallback(
+    async (trade, accept) => {
+      if (!user) return;
+      const tradeRef = doc(db, "trades", trade.id);
+      try {
+        if (accept) {
+          // Verificar que yo (destinatario) tengo lo que se me está pidiendo
+          for (const [cardId, qty] of Object.entries(trade.requestCards || {})) {
+            if ((collection[cardId] || 0) < qty) {
+              setTradeError("Ya no tenés las cartas que te pedían. No se pudo aceptar.");
+              return;
+            }
+          }
+          if ((trade.requestCoins || 0) > coins) {
+            setTradeError("Ya no tenés suficientes monedas. No se pudo aceptar.");
+            return;
+          }
+
+          const myRef = doc(db, "users", user.uid);
+          await runTransaction(db, async (tx) => {
+            const mySnap = await tx.get(myRef);
+            const myData = mySnap.exists() ? mySnap.data() : emptyUserDoc();
+            const newCollection = { ...(myData.collection || {}) };
+            // Pierdo lo que me pidieron (requestCards/requestCoins son lo que YO doy al aceptar)
+            for (const [cardId, qty] of Object.entries(trade.requestCards || {})) {
+              newCollection[cardId] = (newCollection[cardId] || 0) - qty;
+              if (newCollection[cardId] <= 0) delete newCollection[cardId];
+            }
+            // Gano lo que me ofrecieron
+            for (const [cardId, qty] of Object.entries(trade.offerCards || {})) {
+              newCollection[cardId] = (newCollection[cardId] || 0) + qty;
+            }
+            const newCoins = (myData.coins || 0) - (trade.requestCoins || 0) + (trade.offerCoins || 0);
+            tx.update(myRef, { collection: newCollection, coins: newCoins });
+            tx.update(tradeRef, { status: "accepted" });
+          });
+          setCollection((prev) => {
+            const next = { ...prev };
+            for (const [cardId, qty] of Object.entries(trade.requestCards || {})) {
+              next[cardId] = (next[cardId] || 0) - qty;
+              if (next[cardId] <= 0) delete next[cardId];
+            }
+            for (const [cardId, qty] of Object.entries(trade.offerCards || {})) {
+              next[cardId] = (next[cardId] || 0) + qty;
+            }
+            return next;
+          });
+          setCoins((c) => c - (trade.requestCoins || 0) + (trade.offerCoins || 0));
+        } else {
+          await updateDoc(tradeRef, { status: "rejected" });
+        }
+      } catch (err) {
+        setTradeError("No se pudo procesar el trade. Probá de nuevo.");
+      }
+    },
+    [user, collection, coins]
+  );
+
+  const cancelTrade = useCallback(async (tradeId) => {
+    try {
+      await updateDoc(doc(db, "trades", tradeId), { status: "cancelled" });
+    } catch (err) {
+      setTradeError("No se pudo cancelar. Probá de nuevo.");
+    }
   }, []);
 
   const createListing = useCallback(
@@ -1046,6 +1237,34 @@ export default function PokeSobres() {
               Mercado
             </button>
             <button
+              style={{ ...styles.navBtn(view === "trades"), position: "relative" }}
+              onClick={() => setView("trades")}
+            >
+              Trades
+              {incomingTrades.length > 0 && (
+                <span
+                  style={{
+                    position: "absolute",
+                    top: "-4px",
+                    right: "-4px",
+                    background: "#e8424a",
+                    color: "#fff",
+                    borderRadius: "999px",
+                    fontSize: "10px",
+                    fontWeight: 700,
+                    minWidth: "16px",
+                    height: "16px",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    padding: "0 3px",
+                  }}
+                >
+                  {incomingTrades.length}
+                </span>
+              )}
+            </button>
+            <button
               onClick={logout}
               style={{
                 background: "transparent",
@@ -1131,6 +1350,21 @@ export default function PokeSobres() {
             onCreateListing={createListing}
             onCancelListing={cancelListing}
             onBuyListing={buyListing}
+          />
+        )}
+        {authChecked && user && !needsUsername && loadState === "ready" && view === "trades" && (
+          <TradesView
+            cards={cards}
+            friends={friends}
+            friendProfiles={friendProfiles}
+            myCollection={collection}
+            coins={coins}
+            incomingTrades={incomingTrades}
+            outgoingTrades={outgoingTrades}
+            tradeError={tradeError}
+            onPropose={proposeTrade}
+            onRespond={respondTrade}
+            onCancel={cancelTrade}
           />
         )}
       </div>
@@ -1751,6 +1985,322 @@ function LoadingScreen() {
     <div style={{ textAlign: "center", padding: "80px 20px", color: "#c9c3e0" }}>
       <div style={{ fontSize: "40px", marginBottom: "16px" }}>{String.fromCodePoint(0x1f3b4)}</div>
       <p>Cargando cartas del Base Set...</p>
+    </div>
+  );
+}
+
+function TradesView({ cards, friends, friendProfiles, myCollection, coins, incomingTrades, outgoingTrades, tradeError, onPropose, onRespond, onCancel }) {
+  const [tab, setTab] = useState("propose");
+  const friendUids = Object.keys(friends || {});
+
+  const cardById = useCallback((id) => cards.find((c) => c.id === id), [cards]);
+
+  const tabBtn = (id, label) => (
+    <button
+      onClick={() => setTab(id)}
+      style={{
+        background: tab === id ? "#ffd95e" : "transparent",
+        color: tab === id ? "#241b3d" : "#c9c3e0",
+        border: tab === id ? "none" : "1px solid rgba(255,255,255,0.15)",
+        borderRadius: "999px",
+        padding: "8px 18px",
+        fontSize: "13px",
+        fontWeight: 600,
+        cursor: "pointer",
+      }}
+    >{label}</button>
+  );
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "20px", flexWrap: "wrap", gap: "12px" }}>
+        <h2 style={{ fontSize: "20px", fontWeight: 700, margin: 0 }}>Trades</h2>
+        <div style={{ display: "flex", gap: "8px" }}>
+          {tabBtn("propose", "Proponer")}
+          {tabBtn("incoming", `Recibidas (${incomingTrades.length})`)}
+          {tabBtn("outgoing", `Enviadas (${outgoingTrades.length})`)}
+        </div>
+      </div>
+
+      {tradeError && <p style={{ color: "#f0a0a0", fontSize: "13px", marginBottom: "16px" }}>{tradeError}</p>}
+
+      {tab === "propose" && (
+        <TradeProposeForm
+          cards={cards}
+          friendUids={friendUids}
+          friendProfiles={friendProfiles}
+          myCollection={myCollection}
+          coins={coins}
+          onPropose={onPropose}
+        />
+      )}
+
+      {tab === "incoming" && (
+        <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+          {incomingTrades.length === 0 ? (
+            <p style={{ color: "#8d87a8", fontSize: "13px" }}>No tenés propuestas de trade pendientes.</p>
+          ) : (
+            incomingTrades.map((trade) => (
+              <TradeCard key={trade.id} trade={trade} cardById={cardById} perspective="incoming">
+                <div style={{ display: "flex", gap: "8px", marginTop: "10px" }}>
+                  <button
+                    onClick={() => onRespond(trade, true)}
+                    style={{ background: "#a8e6a1", color: "#1c4d24", border: "none", borderRadius: "999px", padding: "8px 18px", fontSize: "13px", fontWeight: 700, cursor: "pointer" }}
+                  >
+                    Aceptar
+                  </button>
+                  <button
+                    onClick={() => onRespond(trade, false)}
+                    style={{ background: "transparent", color: "#c9c3e0", border: "1px solid rgba(255,255,255,0.2)", borderRadius: "999px", padding: "8px 18px", fontSize: "13px", cursor: "pointer" }}
+                  >
+                    Rechazar
+                  </button>
+                </div>
+              </TradeCard>
+            ))
+          )}
+        </div>
+      )}
+
+      {tab === "outgoing" && (
+        <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+          {outgoingTrades.length === 0 ? (
+            <p style={{ color: "#8d87a8", fontSize: "13px" }}>No tenés propuestas enviadas pendientes.</p>
+          ) : (
+            outgoingTrades.map((trade) => (
+              <TradeCard key={trade.id} trade={trade} cardById={cardById} perspective="outgoing">
+                <button
+                  onClick={() => onCancel(trade.id)}
+                  style={{ marginTop: "10px", background: "transparent", color: "#f0a0a0", border: "1px solid rgba(240,160,160,0.3)", borderRadius: "999px", padding: "8px 18px", fontSize: "13px", fontWeight: 700, cursor: "pointer" }}
+                >
+                  Cancelar propuesta
+                </button>
+              </TradeCard>
+            ))
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TradeCard({ trade, cardById, perspective, children }) {
+  const otherUsername = perspective === "incoming" ? trade.fromUsername : trade.toUsername;
+  const youGive = perspective === "incoming" ? trade.requestCards : trade.offerCards;
+  const youGiveCoins = perspective === "incoming" ? trade.requestCoins : trade.offerCoins;
+  const youGet = perspective === "incoming" ? trade.offerCards : trade.requestCards;
+  const youGetCoins = perspective === "incoming" ? trade.offerCoins : trade.requestCoins;
+
+  return (
+    <div style={{ background: "rgba(255,255,255,0.05)", borderRadius: "12px", padding: "16px" }}>
+      <p style={{ fontSize: "13px", color: "#c9c3e0", marginBottom: "10px" }}>
+        {perspective === "incoming" ? `${otherUsername} te propone:` : `Le propusiste a ${otherUsername}:`}
+      </p>
+      <div style={{ display: "flex", gap: "20px", flexWrap: "wrap" }}>
+        <div>
+          <div style={{ fontSize: "11px", color: "#f0a0a0", fontWeight: 700, marginBottom: "6px" }}>VOS DAS</div>
+          <TradeSideList cardsMap={youGive} coins={youGiveCoins} cardById={cardById} />
+        </div>
+        <div>
+          <div style={{ fontSize: "11px", color: "#a8e6a1", fontWeight: 700, marginBottom: "6px" }}>VOS RECIBÍS</div>
+          <TradeSideList cardsMap={youGet} coins={youGetCoins} cardById={cardById} />
+        </div>
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function TradeSideList({ cardsMap, coins, cardById }) {
+  const entries = Object.entries(cardsMap || {});
+  if (entries.length === 0 && !coins) {
+    return <p style={{ fontSize: "12px", color: "#8d87a8" }}>Nada</p>;
+  }
+  return (
+    <div style={{ fontSize: "12px", color: "#f4f1ea" }}>
+      {entries.map(([cardId, qty]) => {
+        const card = cardById(cardId);
+        return (
+          <div key={cardId}>
+            {card ? card.name : cardId} ×{qty}
+          </div>
+        );
+      })}
+      {coins > 0 && <div style={{ color: "#ffd95e" }}>{String.fromCodePoint(0x1fa99)} {coins}</div>}
+    </div>
+  );
+}
+
+function TradeProposeForm({ cards, friendUids, friendProfiles, myCollection, coins, onPropose }) {
+  const [targetUid, setTargetUid] = useState("");
+  const [offerCards, setOfferCards] = useState({});
+  const [offerCoins, setOfferCoins] = useState("");
+  const [requestCards, setRequestCards] = useState({});
+  const [requestCoins, setRequestCoins] = useState("");
+  const [status, setStatus] = useState(null);
+  const [sending, setSending] = useState(false);
+
+  const friendProfile = targetUid ? friendProfiles[targetUid] : null;
+  const myOwnedCards = cards.filter((c) => (myCollection[c.id] || 0) > 0);
+  const friendOwnedCards = friendProfile ? cards.filter((c) => (friendProfile.collection || {})[c.id] > 0) : [];
+
+  const adjustOffer = (cardId, delta, max) => {
+    setOfferCards((prev) => {
+      const next = { ...prev };
+      const newQty = (next[cardId] || 0) + delta;
+      if (newQty <= 0) delete next[cardId];
+      else if (newQty <= max) next[cardId] = newQty;
+      return next;
+    });
+  };
+
+  const adjustRequest = (cardId, delta, max) => {
+    setRequestCards((prev) => {
+      const next = { ...prev };
+      const newQty = (next[cardId] || 0) + delta;
+      if (newQty <= 0) delete next[cardId];
+      else if (newQty <= max) next[cardId] = newQty;
+      return next;
+    });
+  };
+
+  const handleSend = async () => {
+    if (!friendProfile || sending) return;
+    setSending(true);
+    setStatus(null);
+    const result = await onPropose(
+      friendProfile.username,
+      offerCards,
+      parseInt(offerCoins, 10) || 0,
+      requestCards,
+      parseInt(requestCoins, 10) || 0
+    );
+    setStatus(result);
+    setSending(false);
+    if (result.ok) {
+      setOfferCards({});
+      setOfferCoins("");
+      setRequestCards({});
+      setRequestCoins("");
+    }
+  };
+
+  if (friendUids.length === 0) {
+    return <p style={{ color: "#8d87a8", fontSize: "13px" }}>Necesitás tener amigos agregados para proponerles un trade.</p>;
+  }
+
+  return (
+    <div>
+      <select
+        value={targetUid}
+        onChange={(e) => { setTargetUid(e.target.value); setOfferCards({}); setRequestCards({}); }}
+        style={{
+          width: "100%",
+          maxWidth: "320px",
+          background: "rgba(255,255,255,0.06)",
+          border: "1px solid rgba(255,255,255,0.2)",
+          borderRadius: "10px",
+          padding: "10px 14px",
+          color: "#f4f1ea",
+          fontSize: "14px",
+          marginBottom: "20px",
+        }}
+      >
+        <option value="">— Elegí un amigo —</option>
+        {friendUids.map((uid) => (
+          <option key={uid} value={uid}>
+            {friendProfiles[uid]?.username || friendProfiles[uid]?.displayName || "Cargando..."}
+          </option>
+        ))}
+      </select>
+
+      {friendProfile && (
+        <div style={{ display: "flex", gap: "24px", flexWrap: "wrap" }}>
+          <div style={{ flex: 1, minWidth: "240px" }}>
+            <h3 style={{ fontSize: "14px", color: "#f0a0a0", marginBottom: "10px" }}>Vos das</h3>
+            <TradeCardPicker cards={myOwnedCards} ownedMap={myCollection} selected={offerCards} onAdjust={adjustOffer} />
+            <input
+              type="number"
+              min="0"
+              max={coins}
+              value={offerCoins}
+              onChange={(e) => setOfferCoins(e.target.value)}
+              placeholder="Monedas a ofrecer"
+              style={{ width: "100%", marginTop: "10px", background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.2)", borderRadius: "8px", padding: "8px 12px", color: "#f4f1ea", fontSize: "13px", boxSizing: "border-box" }}
+            />
+          </div>
+          <div style={{ flex: 1, minWidth: "240px" }}>
+            <h3 style={{ fontSize: "14px", color: "#a8e6a1", marginBottom: "10px" }}>Vos pedís</h3>
+            {friendOwnedCards.length === 0 ? (
+              <p style={{ fontSize: "12px", color: "#8d87a8" }}>Tu amigo no tiene cartas para pedirle todavía.</p>
+            ) : (
+              <TradeCardPicker cards={friendOwnedCards} ownedMap={friendProfile.collection || {}} selected={requestCards} onAdjust={adjustRequest} />
+            )}
+            <input
+              type="number"
+              min="0"
+              value={requestCoins}
+              onChange={(e) => setRequestCoins(e.target.value)}
+              placeholder="Monedas a pedir"
+              style={{ width: "100%", marginTop: "10px", background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.2)", borderRadius: "8px", padding: "8px 12px", color: "#f4f1ea", fontSize: "13px", boxSizing: "border-box" }}
+            />
+          </div>
+        </div>
+      )}
+
+      {status && (
+        <p style={{ fontSize: "13px", color: status.ok ? "#a8e6a1" : "#f0a0a0", marginTop: "16px" }}>{status.message}</p>
+      )}
+
+      {friendProfile && (
+        <button
+          onClick={handleSend}
+          disabled={sending}
+          style={{
+            marginTop: "16px",
+            background: "#ffd95e",
+            color: "#241b3d",
+            border: "none",
+            borderRadius: "999px",
+            padding: "12px 32px",
+            fontWeight: 700,
+            fontSize: "15px",
+            cursor: sending ? "not-allowed" : "pointer",
+            opacity: sending ? 0.6 : 1,
+          }}
+        >
+          {sending ? "Enviando..." : "Enviar propuesta"}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function TradeCardPicker({ cards, ownedMap, selected, onAdjust }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: "6px", maxHeight: "220px", overflowY: "auto" }}>
+      {cards.map((card) => {
+        const max = ownedMap[card.id] || 0;
+        const qty = selected[card.id] || 0;
+        return (
+          <div key={card.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", background: "rgba(255,255,255,0.04)", borderRadius: "8px", padding: "6px 10px" }}>
+            <span style={{ fontSize: "12px" }}>{card.name} <span style={{ color: "#8d87a8" }}>(×{max})</span></span>
+            <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+              <button
+                onClick={() => onAdjust(card.id, -1, max)}
+                disabled={qty <= 0}
+                style={{ width: "22px", height: "22px", borderRadius: "6px", border: "1px solid rgba(255,255,255,0.2)", background: "transparent", color: "#f4f1ea", cursor: qty <= 0 ? "not-allowed" : "pointer", opacity: qty <= 0 ? 0.4 : 1 }}
+              >−</button>
+              <span style={{ fontSize: "12px", minWidth: "14px", textAlign: "center" }}>{qty}</span>
+              <button
+                onClick={() => onAdjust(card.id, 1, max)}
+                disabled={qty >= max}
+                style={{ width: "22px", height: "22px", borderRadius: "6px", border: "1px solid rgba(255,255,255,0.2)", background: "transparent", color: "#f4f1ea", cursor: qty >= max ? "not-allowed" : "pointer", opacity: qty >= max ? 0.4 : 1 }}
+              >+</button>
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
 }

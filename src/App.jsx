@@ -2216,7 +2216,7 @@ function TradeProposeForm({ cards, friendUids, friendProfiles, myCollection, coi
 
       {friendProfile && (
         <div style={{ display: "flex", gap: "24px", flexWrap: "wrap" }}>
-          <div style={{ flex: 1, minWidth: "240px" }}>
+          <div style={{ flex: 1, minWidth: "280px" }}>
             <h3 style={{ fontSize: "14px", color: "#f0a0a0", marginBottom: "10px" }}>Vos das</h3>
             <TradeCardPicker cards={myOwnedCards} ownedMap={myCollection} selected={offerCards} onAdjust={adjustOffer} />
             <input
@@ -2229,7 +2229,7 @@ function TradeProposeForm({ cards, friendUids, friendProfiles, myCollection, coi
               style={{ width: "100%", marginTop: "10px", background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.2)", borderRadius: "8px", padding: "8px 12px", color: "#f4f1ea", fontSize: "13px", boxSizing: "border-box" }}
             />
           </div>
-          <div style={{ flex: 1, minWidth: "240px" }}>
+          <div style={{ flex: 1, minWidth: "280px" }}>
             <h3 style={{ fontSize: "14px", color: "#a8e6a1", marginBottom: "10px" }}>Vos pedís</h3>
             {friendOwnedCards.length === 0 ? (
               <p style={{ fontSize: "12px", color: "#8d87a8" }}>Tu amigo no tiene cartas para pedirle todavía.</p>
@@ -2278,26 +2278,94 @@ function TradeProposeForm({ cards, friendUids, friendProfiles, myCollection, coi
 
 function TradeCardPicker({ cards, ownedMap, selected, onAdjust }) {
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: "6px", maxHeight: "220px", overflowY: "auto" }}>
+    <div
+      style={{
+        display: "grid",
+        gridTemplateColumns: "repeat(auto-fill, minmax(86px, 1fr))",
+        gap: "10px",
+        maxHeight: "320px",
+        overflowY: "auto",
+        padding: "4px",
+      }}
+    >
       {cards.map((card) => {
         const max = ownedMap[card.id] || 0;
         const qty = selected[card.id] || 0;
+        const isSelected = qty > 0;
         return (
-          <div key={card.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", background: "rgba(255,255,255,0.04)", borderRadius: "8px", padding: "6px 10px" }}>
-            <span style={{ fontSize: "12px" }}>{card.name} <span style={{ color: "#8d87a8" }}>(×{max})</span></span>
-            <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-              <button
-                onClick={() => onAdjust(card.id, -1, max)}
-                disabled={qty <= 0}
-                style={{ width: "22px", height: "22px", borderRadius: "6px", border: "1px solid rgba(255,255,255,0.2)", background: "transparent", color: "#f4f1ea", cursor: qty <= 0 ? "not-allowed" : "pointer", opacity: qty <= 0 ? 0.4 : 1 }}
-              >−</button>
-              <span style={{ fontSize: "12px", minWidth: "14px", textAlign: "center" }}>{qty}</span>
-              <button
-                onClick={() => onAdjust(card.id, 1, max)}
-                disabled={qty >= max}
-                style={{ width: "22px", height: "22px", borderRadius: "6px", border: "1px solid rgba(255,255,255,0.2)", background: "transparent", color: "#f4f1ea", cursor: qty >= max ? "not-allowed" : "pointer", opacity: qty >= max ? 0.4 : 1 }}
-              >+</button>
-            </div>
+          <div
+            key={card.id}
+            onClick={() => onAdjust(card.id, 1, max)}
+            style={{
+              position: "relative",
+              background: "rgba(255,255,255,0.04)",
+              borderRadius: "8px",
+              padding: "6px",
+              textAlign: "center",
+              cursor: qty >= max ? "default" : "pointer",
+              border: isSelected ? `2px solid ${rarityColor(card.rarity)}` : "2px solid transparent",
+              transition: "border-color 0.15s ease",
+            }}
+          >
+            <img
+              src={card.images.small}
+              alt={card.name}
+              onError={(e) => {
+                e.target.onerror = null;
+                e.target.src =
+                  "data:image/svg+xml;utf8," +
+                  encodeURIComponent(
+                    '<svg xmlns="http://www.w3.org/2000/svg" width="80" height="112"><rect width="80" height="112" fill="#352a55"/></svg>'
+                  );
+              }}
+              style={{ width: "100%", borderRadius: "5px", marginBottom: "4px" }}
+            />
+            <div style={{ fontSize: "10px", fontWeight: 600, lineHeight: 1.15, marginBottom: "3px" }}>{card.name}</div>
+            <div style={{ fontSize: "9px", color: "#8d87a8", marginBottom: "4px" }}>×{max} disponibles</div>
+
+            {isSelected ? (
+              <div
+                onClick={(e) => e.stopPropagation()}
+                style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "6px" }}
+              >
+                <button
+                  onClick={() => onAdjust(card.id, -1, max)}
+                  style={{
+                    width: "20px",
+                    height: "20px",
+                    borderRadius: "5px",
+                    border: "1px solid rgba(255,255,255,0.25)",
+                    background: "rgba(255,255,255,0.08)",
+                    color: "#f4f1ea",
+                    fontSize: "12px",
+                    cursor: "pointer",
+                    lineHeight: 1,
+                  }}
+                >
+                  −
+                </button>
+                <span style={{ fontSize: "12px", fontWeight: 700, color: "#ffd95e", minWidth: "12px" }}>{qty}</span>
+                <button
+                  onClick={() => onAdjust(card.id, 1, max)}
+                  disabled={qty >= max}
+                  style={{
+                    width: "20px",
+                    height: "20px",
+                    borderRadius: "5px",
+                    border: "1px solid rgba(255,255,255,0.25)",
+                    background: "rgba(255,255,255,0.08)",
+                    color: qty >= max ? "#665f80" : "#f4f1ea",
+                    fontSize: "12px",
+                    cursor: qty >= max ? "not-allowed" : "pointer",
+                    lineHeight: 1,
+                  }}
+                >
+                  +
+                </button>
+              </div>
+            ) : (
+              <div style={{ fontSize: "10px", color: "#ffd95e", fontWeight: 600 }}>Tocar para elegir</div>
+            )}
           </div>
         );
       })}

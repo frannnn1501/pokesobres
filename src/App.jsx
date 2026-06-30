@@ -288,6 +288,8 @@ export default function PokeSobres() {
   const [friendRequests, setFriendRequests] = useState([]);
   const [friendProfiles, setFriendProfiles] = useState({});
   const [viewingFriendUid, setViewingFriendUid] = useState(null);
+  const [listings, setListings] = useState([]);
+  const [marketError, setMarketError] = useState("");
   const [view, setView] = useState("home");
   const [revealing, setRevealing] = useState(false);
   const [revealedCards, setRevealedCards] = useState([]);
@@ -551,6 +553,141 @@ export default function PokeSobres() {
     );
     return () => unsub();
   }, [user, friends]);
+
+  // Listener en tiempo real de todas las listings activas del mercado
+  useEffect(() => {
+    const q = query(
+      fsCollection(db, "listings"),
+      where("status", "==", "active")
+    );
+    const unsub = onSnapshot(q, (snap) => {
+      setListings(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+    }, () => {});
+    return () => unsub();
+  }, []);
+
+  const createListing = useCallback(
+    async (cardId, price) => {
+      if (!user || !username) return { ok: false, message: "Necesitás estar logueado." };
+      const card = cards.find((c) => c.id === cardId);
+      if (!card) return { ok: false, message: "Carta no encontrada." };
+      const parsedPrice = parseInt(price, 10);
+      if (isNaN(parsedPrice) || parsedPrice < 1) return { ok: false, message: "El precio debe ser al menos 1 moneda." };
+
+      const userRef = doc(db, "users", user.uid);
+      try {
+        await runTransaction(db, async (tx) => {
+          const userSnap = await tx.get(userRef);
+          const data = userSnap.exists() ? userSnap.data() : emptyUserDoc();
+          const owned = (data.collection || {})[cardId] || 0;
+          if (owned <= 0) throw new Error("NO_CARD");
+
+          const newCollection = { ...(data.collection || {}) };
+          if (owned <= 1) delete newCollection[cardId];
+          else newCollection[cardId] = owned - 1;
+
+          tx.update(userRef, { collection: newCollection });
+          tx.set(doc(fsCollection(db, "listings")), {
+            sellerUid: user.uid,
+            sellerUsername: username,
+            cardId,
+            cardName: card.name,
+            cardRarity: card.rarity,
+            cardImage: card.images.small,
+            price: parsedPrice,
+            status: "active",
+            createdAt: todayStr(),
+          });
+        });
+        setCollection((prev) => {
+          const next = { ...prev };
+          if ((next[cardId] || 0) <= 1) delete next[cardId];
+          else next[cardId] = (next[cardId] || 1) - 1;
+          return next;
+        });
+        return { ok: true, message: `Carta publicada por ${parsedPrice} monedas.` };
+      } catch (err) {
+        if (err.message === "NO_CARD") return { ok: false, message: "Ya no tenés esa carta." };
+        return { ok: false, message: "No se pudo publicar. Probá de nuevo." };
+      }
+    },
+    [user, username, cards]
+  );
+
+  const cancelListing = useCallback(
+    async (listingId, cardId) => {
+      if (!user) return;
+      const listingRef = doc(db, "listings", listingId);
+      const userRef = doc(db, "users", user.uid);
+      try {
+        await runTransaction(db, async (tx) => {
+          const listingSnap = await tx.get(listingRef);
+          if (!listingSnap.exists() || listingSnap.data().sellerUid !== user.uid) throw new Error("NOT_YOURS");
+          if (listingSnap.data().status !== "active") throw new Error("NOT_ACTIVE");
+
+          const userSnap = await tx.get(userRef);
+          const data = userSnap.exists() ? userSnap.data() : emptyUserDoc();
+          const newCollection = { ...(data.collection || {}) };
+          newCollection[cardId] = (newCollection[cardId] || 0) + 1;
+
+          tx.update(listingRef, { status: "cancelled" });
+          tx.update(userRef, { collection: newCollection });
+        });
+        setCollection((prev) => ({ ...prev, [cardId]: (prev[cardId] || 0) + 1 }));
+      } catch (err) {
+        setMarketError("No se pudo cancelar la publicación. Probá de nuevo.");
+      }
+    },
+    [user]
+  );
+
+  const buyListing = useCallback(
+    async (listing) => {
+      if (!user) return { ok: false, message: "Necesitás estar logueado." };
+      if (listing.sellerUid === user.uid) return { ok: false, message: "No podés comprar tu propia carta." };
+      if (coins < listing.price) return { ok: false, message: "No tenés suficientes monedas." };
+
+      const listingRef = doc(db, "listings", listing.id);
+      const buyerRef = doc(db, "users", user.uid);
+      const sellerRef = doc(db, "users", listing.sellerUid);
+      try {
+        await runTransaction(db, async (tx) => {
+          const listingSnap = await tx.get(listingRef);
+          if (!listingSnap.exists() || listingSnap.data().status !== "active") throw new Error("NOT_AVAILABLE");
+
+          const buyerSnap = await tx.get(buyerRef);
+          const buyerData = buyerSnap.exists() ? buyerSnap.data() : emptyUserDoc();
+          if ((buyerData.coins || 0) < listing.price) throw new Error("NOT_ENOUGH_COINS");
+
+          const sellerSnap = await tx.get(sellerRef);
+          const sellerData = sellerSnap.exists() ? sellerSnap.data() : emptyUserDoc();
+
+          const newBuyerCollection = { ...(buyerData.collection || {}) };
+          newBuyerCollection[listing.cardId] = (newBuyerCollection[listing.cardId] || 0) + 1;
+
+          tx.update(listingRef, { status: "sold", buyerUid: user.uid, buyerUsername: username });
+          tx.update(buyerRef, {
+            coins: (buyerData.coins || 0) - listing.price,
+            collection: newBuyerCollection,
+          });
+          tx.update(sellerRef, {
+            coins: (sellerData.coins || 0) + listing.price,
+          });
+        });
+
+        setCoins((c) => c - listing.price);
+        setCollection((prev) => ({ ...prev, [listing.cardId]: (prev[listing.cardId] || 0) + 1 }));
+        playTone(523, 0.1, "sine", 0.04);
+        playTone(659, 0.15, "sine", 0.04);
+        return { ok: true, message: `¡Compraste ${listing.cardName}!` };
+      } catch (err) {
+        if (err.message === "NOT_AVAILABLE") return { ok: false, message: "Esa carta ya no está disponible." };
+        if (err.message === "NOT_ENOUGH_COINS") return { ok: false, message: "No tenés suficientes monedas." };
+        return { ok: false, message: "No se pudo completar la compra. Probá de nuevo." };
+      }
+    },
+    [user, username, coins, playTone]
+  );
 
   // Cargar los perfiles públicos básicos de mis amigos (nombre, colección) para la lista
   useEffect(() => {
@@ -892,6 +1029,12 @@ export default function PokeSobres() {
               )}
             </button>
             <button
+              style={styles.navBtn(view === "market")}
+              onClick={() => setView("market")}
+            >
+              Mercado
+            </button>
+            <button
               onClick={logout}
               style={{
                 background: "transparent",
@@ -964,6 +1107,19 @@ export default function PokeSobres() {
             cards={cards}
             friendProfile={friendProfiles[viewingFriendUid]}
             onBack={() => setViewingFriendUid(null)}
+          />
+        )}
+        {authChecked && user && !needsUsername && loadState === "ready" && view === "market" && (
+          <MarketView
+            listings={listings}
+            cards={cards}
+            myUid={user.uid}
+            myCollection={collection}
+            coins={coins}
+            marketError={marketError}
+            onCreateListing={createListing}
+            onCancelListing={cancelListing}
+            onBuyListing={buyListing}
           />
         )}
       </div>
@@ -1345,6 +1501,236 @@ function FriendCollectionView({ cards, friendProfile, onBack }) {
           );
         })}
       </div>
+    </div>
+  );
+}
+
+function MarketView({ listings, cards, myUid, myCollection, coins, marketError, onCreateListing, onCancelListing, onBuyListing }) {
+  const [tab, setTab] = useState("explore");
+  const [sellCardId, setSellCardId] = useState("");
+  const [sellPrice, setSellPrice] = useState("");
+  const [sellStatus, setSellStatus] = useState(null);
+  const [buyStatus, setBuyStatus] = useState({});
+
+  const myListings = listings.filter((l) => l.sellerUid === myUid);
+  const otherListings = listings.filter((l) => l.sellerUid !== myUid);
+  const ownedCards = cards.filter((c) => (myCollection[c.id] || 0) > 0);
+
+  const handleSell = async () => {
+    if (!sellCardId) { setSellStatus({ ok: false, message: "Elegí una carta." }); return; }
+    setSellStatus(null);
+    const result = await onCreateListing(sellCardId, sellPrice);
+    setSellStatus(result);
+    if (result.ok) { setSellCardId(""); setSellPrice(""); }
+  };
+
+  const handleBuy = async (listing) => {
+    setBuyStatus((s) => ({ ...s, [listing.id]: "buying" }));
+    const result = await onBuyListing(listing);
+    setBuyStatus((s) => ({ ...s, [listing.id]: result.ok ? "ok" : result.message }));
+    setTimeout(() => setBuyStatus((s) => { const n = { ...s }; delete n[listing.id]; return n; }), 3000);
+  };
+
+  const tabBtn = (id, label) => (
+    <button
+      onClick={() => setTab(id)}
+      style={{
+        background: tab === id ? "#ffd95e" : "transparent",
+        color: tab === id ? "#241b3d" : "#c9c3e0",
+        border: tab === id ? "none" : "1px solid rgba(255,255,255,0.15)",
+        borderRadius: "999px",
+        padding: "8px 18px",
+        fontSize: "13px",
+        fontWeight: 600,
+        cursor: "pointer",
+      }}
+    >{label}</button>
+  );
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "20px", flexWrap: "wrap", gap: "12px" }}>
+        <h2 style={{ fontSize: "20px", fontWeight: 700, margin: 0 }}>Mercado</h2>
+        <div style={{ display: "flex", gap: "8px" }}>
+          {tabBtn("explore", `Explorar (${otherListings.length})`)}
+          {tabBtn("mine", `Mis publicaciones (${myListings.length})`)}
+          {tabBtn("sell", "Publicar carta")}
+        </div>
+      </div>
+
+      {marketError && <p style={{ color: "#f0a0a0", fontSize: "13px", marginBottom: "16px" }}>{marketError}</p>}
+
+      {tab === "explore" && (
+        <div>
+          {otherListings.length === 0 ? (
+            <p style={{ color: "#8d87a8", fontSize: "13px" }}>No hay cartas en venta por otros jugadores por el momento.</p>
+          ) : (
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))", gap: "14px" }}>
+              {otherListings.sort((a, b) => a.price - b.price).map((listing) => {
+                const canAfford = coins >= listing.price;
+                const status = buyStatus[listing.id];
+                return (
+                  <div key={listing.id} style={{ background: "rgba(255,255,255,0.04)", borderRadius: "10px", padding: "10px", textAlign: "center", border: `1px solid ${rarityColor(listing.cardRarity)}44` }}>
+                    <img
+                      src={listing.cardImage}
+                      alt={listing.cardName}
+                      onError={(e) => { e.target.onerror = null; e.target.src = "data:image/svg+xml;utf8," + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="100" height="140"><rect width="100" height="140" fill="#352a55"/></svg>'); }}
+                      style={{ width: "100%", borderRadius: "6px", marginBottom: "6px" }}
+                    />
+                    <div style={{ fontSize: "11px", fontWeight: 600, lineHeight: 1.2, marginBottom: "3px" }}>{listing.cardName}</div>
+                    <div style={{ fontSize: "10px", color: rarityColor(listing.cardRarity), marginBottom: "3px" }}>{listing.cardRarity}</div>
+                    <div style={{ fontSize: "10px", color: "#8d87a8", marginBottom: "8px" }}>@{listing.sellerUsername}</div>
+                    <div style={{ fontSize: "13px", fontWeight: 700, color: "#ffd95e", marginBottom: "8px" }}>
+                      {String.fromCodePoint(0x1fa99)} {listing.price}
+                    </div>
+                    {status === "buying" ? (
+                      <div style={{ fontSize: "11px", color: "#c9c3e0" }}>Comprando...</div>
+                    ) : status === "ok" ? (
+                      <div style={{ fontSize: "11px", color: "#a8e6a1" }}>¡Comprado!</div>
+                    ) : status ? (
+                      <div style={{ fontSize: "10px", color: "#f0a0a0" }}>{status}</div>
+                    ) : (
+                      <button
+                        onClick={() => handleBuy(listing)}
+                        disabled={!canAfford}
+                        style={{
+                          width: "100%",
+                          background: canAfford ? "rgba(255,217,94,0.15)" : "rgba(255,255,255,0.05)",
+                          color: canAfford ? "#ffd95e" : "#665f80",
+                          border: `1px solid ${canAfford ? "rgba(255,217,94,0.4)" : "rgba(255,255,255,0.1)"}`,
+                          borderRadius: "999px",
+                          padding: "5px 0",
+                          fontSize: "11px",
+                          fontWeight: 700,
+                          cursor: canAfford ? "pointer" : "not-allowed",
+                        }}
+                      >
+                        {canAfford ? "Comprar" : "Sin monedas"}
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {tab === "mine" && (
+        <div>
+          {myListings.length === 0 ? (
+            <p style={{ color: "#8d87a8", fontSize: "13px" }}>No tenés cartas publicadas. Usá "Publicar carta" para vender.</p>
+          ) : (
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))", gap: "14px" }}>
+              {myListings.map((listing) => (
+                <div key={listing.id} style={{ background: "rgba(255,255,255,0.04)", borderRadius: "10px", padding: "10px", textAlign: "center", border: `1px solid ${rarityColor(listing.cardRarity)}44` }}>
+                  <img
+                    src={listing.cardImage}
+                    alt={listing.cardName}
+                    onError={(e) => { e.target.onerror = null; e.target.src = "data:image/svg+xml;utf8," + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="100" height="140"><rect width="100" height="140" fill="#352a55"/></svg>'); }}
+                    style={{ width: "100%", borderRadius: "6px", marginBottom: "6px" }}
+                  />
+                  <div style={{ fontSize: "11px", fontWeight: 600, lineHeight: 1.2, marginBottom: "4px" }}>{listing.cardName}</div>
+                  <div style={{ fontSize: "13px", fontWeight: 700, color: "#ffd95e", marginBottom: "8px" }}>
+                    {String.fromCodePoint(0x1fa99)} {listing.price}
+                  </div>
+                  <button
+                    onClick={() => onCancelListing(listing.id, listing.cardId)}
+                    style={{
+                      width: "100%",
+                      background: "transparent",
+                      color: "#f0a0a0",
+                      border: "1px solid rgba(240,160,160,0.3)",
+                      borderRadius: "999px",
+                      padding: "5px 0",
+                      fontSize: "11px",
+                      fontWeight: 700,
+                      cursor: "pointer",
+                    }}
+                  >
+                    Cancelar
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {tab === "sell" && (
+        <div style={{ maxWidth: "400px" }}>
+          <p style={{ color: "#8d87a8", fontSize: "13px", marginBottom: "20px" }}>
+            Elegí una carta de tu colección y poné el precio. La carta sale de tu inventario al publicarla — si la cancelás, vuelve.
+          </p>
+          {ownedCards.length === 0 ? (
+            <p style={{ color: "#f0a0a0", fontSize: "13px" }}>No tenés cartas para vender. ¡Abrí más sobres!</p>
+          ) : (
+            <>
+              <select
+                value={sellCardId}
+                onChange={(e) => setSellCardId(e.target.value)}
+                style={{
+                  width: "100%",
+                  background: "rgba(255,255,255,0.06)",
+                  border: "1px solid rgba(255,255,255,0.2)",
+                  borderRadius: "10px",
+                  padding: "10px 14px",
+                  color: "#f4f1ea",
+                  fontSize: "14px",
+                  marginBottom: "12px",
+                }}
+              >
+                <option value="">— Elegí una carta —</option>
+                {ownedCards.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name} ({c.rarity}) ×{myCollection[c.id]}
+                  </option>
+                ))}
+              </select>
+              <input
+                type="number"
+                min="1"
+                value={sellPrice}
+                onChange={(e) => setSellPrice(e.target.value)}
+                placeholder="Precio en monedas"
+                style={{
+                  width: "100%",
+                  background: "rgba(255,255,255,0.06)",
+                  border: "1px solid rgba(255,255,255,0.2)",
+                  borderRadius: "10px",
+                  padding: "10px 14px",
+                  color: "#f4f1ea",
+                  fontSize: "14px",
+                  marginBottom: "12px",
+                  boxSizing: "border-box",
+                }}
+              />
+              {sellStatus && (
+                <p style={{ fontSize: "13px", color: sellStatus.ok ? "#a8e6a1" : "#f0a0a0", marginBottom: "12px" }}>
+                  {sellStatus.message}
+                </p>
+              )}
+              <button
+                onClick={handleSell}
+                disabled={!sellCardId || !sellPrice}
+                style={{
+                  width: "100%",
+                  background: sellCardId && sellPrice ? "#ffd95e" : "rgba(255,255,255,0.1)",
+                  color: sellCardId && sellPrice ? "#241b3d" : "#888",
+                  border: "none",
+                  borderRadius: "999px",
+                  padding: "12px 0",
+                  fontWeight: 700,
+                  fontSize: "15px",
+                  cursor: sellCardId && sellPrice ? "pointer" : "not-allowed",
+                }}
+              >
+                Publicar en el mercado
+              </button>
+            </>
+          )}
+        </div>
+      )}
     </div>
   );
 }

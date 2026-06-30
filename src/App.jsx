@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback, useRef } from "react";
 import { BASE1_CARDS } from "./base1data";
 import { auth, db, googleProvider } from "./firebase";
 import { signInWithPopup, signOut, onAuthStateChanged } from "firebase/auth";
-import { doc, getDoc, setDoc, updateDoc, runTransaction, collection, query, where, getDocs, addDoc, onSnapshot } from "firebase/firestore";
+import { doc, getDoc, setDoc, updateDoc, runTransaction, collection as fsCollection, query, where, getDocs, addDoc, onSnapshot } from "firebase/firestore";
 
 function buildCards() {
   return BASE1_CARDS.map(([number, name, rarity]) => ({
@@ -430,7 +430,7 @@ export default function PokeSobres() {
         }
 
         const existingQuery = query(
-          collection(db, "friendRequests"),
+          fsCollection(db, "friendRequests"),
           where("fromUid", "==", user.uid),
           where("toUid", "==", targetUid),
           where("status", "==", "pending")
@@ -440,7 +440,7 @@ export default function PokeSobres() {
           return { ok: false, message: "Ya le mandaste una solicitud, esperá a que responda." };
         }
 
-        await addDoc(collection(db, "friendRequests"), {
+        await addDoc(fsCollection(db, "friendRequests"), {
           fromUid: user.uid,
           fromUsername: username,
           toUid: targetUid,
@@ -506,7 +506,7 @@ export default function PokeSobres() {
       return;
     }
     const q = query(
-      collection(db, "friendRequests"),
+      fsCollection(db, "friendRequests"),
       where("toUid", "==", user.uid),
       where("status", "==", "pending")
     );
@@ -525,7 +525,7 @@ export default function PokeSobres() {
   useEffect(() => {
     if (!user) return;
     const q = query(
-      collection(db, "friendRequests"),
+      fsCollection(db, "friendRequests"),
       where("fromUid", "==", user.uid),
       where("status", "==", "accepted")
     );

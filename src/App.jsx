@@ -71,12 +71,25 @@ function isValidUsername(name) {
   return /^[a-z0-9_]{3,20}$/.test(name);
 }
 
+function isEnergyCard(card) {
+  return card.name.endsWith("Energy");
+}
+
 function drawPack(cards) {
-  const commons = cards.filter((c) => c.rarity === "Common");
+  const energies = cards.filter((c) => c.rarity === "Common" && isEnergyCard(c));
+  const commonsNonEnergy = cards.filter((c) => c.rarity === "Common" && !isEnergyCard(c));
   const others = cards.filter((c) => c.rarity !== "Common");
+
   const pulled = [];
-  for (let i = 0; i < CARDS_PER_PACK - 1; i++) {
-    pulled.push(weightedPick(commons.length ? commons : cards));
+  // Una sola energía por sobre, con una chance de que aparezca (60%) como cualquier común
+  const includeEnergy = energies.length > 0 && Math.random() < 0.6;
+  const commonSlots = CARDS_PER_PACK - 1 - (includeEnergy ? 1 : 0);
+
+  for (let i = 0; i < commonSlots; i++) {
+    pulled.push(weightedPick(commonsNonEnergy.length ? commonsNonEnergy : cards));
+  }
+  if (includeEnergy) {
+    pulled.push(energies[Math.floor(Math.random() * energies.length)]);
   }
   pulled.push(weightedPick(others.length ? others : cards));
   pulled.sort((a, b) => rarityRank(a.rarity) - rarityRank(b.rarity));
@@ -580,11 +593,10 @@ export default function PokeSobres() {
           const userSnap = await tx.get(userRef);
           const data = userSnap.exists() ? userSnap.data() : emptyUserDoc();
           const owned = (data.collection || {})[cardId] || 0;
-          if (owned <= 0) throw new Error("NO_CARD");
+          if (owned <= 1) throw new Error("NOT_ENOUGH_COPIES");
 
           const newCollection = { ...(data.collection || {}) };
-          if (owned <= 1) delete newCollection[cardId];
-          else newCollection[cardId] = owned - 1;
+          newCollection[cardId] = owned - 1;
 
           tx.update(userRef, { collection: newCollection });
           tx.set(doc(fsCollection(db, "listings")), {
@@ -601,13 +613,12 @@ export default function PokeSobres() {
         });
         setCollection((prev) => {
           const next = { ...prev };
-          if ((next[cardId] || 0) <= 1) delete next[cardId];
-          else next[cardId] = (next[cardId] || 1) - 1;
+          next[cardId] = (next[cardId] || 1) - 1;
           return next;
         });
         return { ok: true, message: `Carta publicada por ${parsedPrice} monedas.` };
       } catch (err) {
-        if (err.message === "NO_CARD") return { ok: false, message: "Ya no tenés esa carta." };
+        if (err.message === "NOT_ENOUGH_COPIES") return { ok: false, message: "No podés publicar tu última copia de esa carta." };
         return { ok: false, message: "No se pudo publicar. Probá de nuevo." };
       }
     },
@@ -801,15 +812,11 @@ export default function PokeSobres() {
           const snap = await tx.get(ref);
           const data = snap.exists() ? snap.data() : emptyUserDoc();
           const owned = (data.collection || {})[cardId] || 0;
-          if (owned <= 0) {
-            throw new Error("NOT_OWNED");
+          if (owned <= 1) {
+            throw new Error("NOT_ENOUGH_COPIES");
           }
           const newCollection = { ...data.collection };
-          if (owned <= 1) {
-            delete newCollection[cardId];
-          } else {
-            newCollection[cardId] = owned - 1;
-          }
+          newCollection[cardId] = owned - 1;
           const newData = {
             ...data,
             collection: newCollection,
@@ -824,7 +831,11 @@ export default function PokeSobres() {
         playTone(523, 0.1, "sine", 0.04);
         playTone(659, 0.12, "sine", 0.04);
       } catch (err) {
-        setAuthError("No se pudo vender la carta. Probá de nuevo.");
+        if (err.message === "NOT_ENOUGH_COPIES") {
+          setAuthError("No podés vender tu última copia de esa carta.");
+        } else {
+          setAuthError("No se pudo vender la carta. Probá de nuevo.");
+        }
       }
     },
     [user, cards, playTone]
@@ -1514,7 +1525,7 @@ function MarketView({ listings, cards, myUid, myCollection, coins, marketError, 
 
   const myListings = listings.filter((l) => l.sellerUid === myUid);
   const otherListings = listings.filter((l) => l.sellerUid !== myUid);
-  const ownedCards = cards.filter((c) => (myCollection[c.id] || 0) > 0);
+  const ownedCards = cards.filter((c) => (myCollection[c.id] || 0) > 1);
 
   const handleSell = async () => {
     if (!sellCardId) { setSellStatus({ ok: false, message: "Elegí una carta." }); return; }
@@ -1938,7 +1949,7 @@ function CollectionView({ cards, collection, ownedUnique, totalUnique, coins, on
                   ×{owned}
                 </div>
               )}
-              {owned > 0 && (
+              {owned > 1 && (
                 <button
                   onClick={() => onSell(card.id)}
                   style={{

@@ -4,18 +4,49 @@ import { auth, db, googleProvider } from "./firebase";
 import { signInWithPopup, signOut, onAuthStateChanged } from "firebase/auth";
 import { doc, getDoc, setDoc, updateDoc, runTransaction, collection as fsCollection, query, where, getDocs, addDoc, onSnapshot } from "firebase/firestore";
 
+const POKEMON_NUMBERS = new Set([
+  "1","2","3","4","5","6","7","8","9","10","11","12","13","14","15","16",
+  "17","18","19","20","21","22","23","24","25","26","27","28","29","30",
+  "31","32","33","34","35","36","37","38","39","40","41","42","43","44",
+  "45","46","47","48","49","50","51","52","53","54","55","56","57","58",
+  "59","60","61","62","63","64","65","66","67","68","69"
+]);
+
+function isPokemonCard(number) {
+  return POKEMON_NUMBERS.has(String(number));
+}
+
 function buildCards() {
-  return BASE1_CARDS.map(([number, name, rarity]) => ({
+  const base = BASE1_CARDS.map(([number, name, rarity]) => ({
     id: `base1-${number}`,
     name,
     number,
     rarity,
+    isShiny: false,
     supertype: "Pokémon/Trainer/Energy",
     images: {
       small: `https://images.pokemontcg.io/base1/${number}.png`,
       large: `https://images.pokemontcg.io/base1/${number}_hires.png`,
     },
   }));
+
+  // Agregar variantes shiny para cada Pokémon (IDs separados, entradas propias en la colección)
+  const shinies = BASE1_CARDS
+    .filter(([number]) => isPokemonCard(number))
+    .map(([number, name, rarity]) => ({
+      id: `base1-${number}-shiny`,
+      name: `✨ ${name}`,
+      number,
+      rarity: rarity === "Common" || rarity === "Uncommon" ? rarity : rarity, // mantiene rareza base
+      isShiny: true,
+      supertype: "Pokémon/Trainer/Energy",
+      images: {
+        small: `https://images.pokemontcg.io/base1/${number}.png`,
+        large: `https://images.pokemontcg.io/base1/${number}_hires.png`,
+      },
+    }));
+
+  return [...base, ...shinies];
 }
 
 const MAX_PACKS_PER_DAY = 4;
@@ -28,11 +59,12 @@ const SELL_PRICE = {
   "Rare Holo": 60,
 };
 const RARITY_WEIGHTS = {
-  Common: 60,
+  Common: 57,
   Uncommon: 30,
-  Rare: 9,
-  "Rare Holo": 1,
+  Rare: 11,
+  "Rare Holo": 2,
 };
+const SHINY_CHANCE = 0.01; // 1% de chance de que cualquier Pokémon común/uncommon salga shiny
 
 function todayStr() {
   return new Date().toLocaleDateString("en-CA");
@@ -75,23 +107,34 @@ function isEnergyCard(card) {
   return card.name.endsWith("Energy");
 }
 
+function maybeMakeShiny(card, allCards) {
+  if (!isPokemonCard(card.number)) return card;
+  if (card.isShiny) return card;
+  if (Math.random() < SHINY_CHANCE) {
+    const shiny = allCards.find((c) => c.id === `${card.id}-shiny`);
+    return shiny || card;
+  }
+  return card;
+}
+
 function drawPack(cards) {
-  const energies = cards.filter((c) => c.rarity === "Common" && isEnergyCard(c));
-  const commonsNonEnergy = cards.filter((c) => c.rarity === "Common" && !isEnergyCard(c));
-  const others = cards.filter((c) => c.rarity !== "Common");
+  const energies = cards.filter((c) => c.rarity === "Common" && isEnergyCard(c) && !c.isShiny);
+  const commonsNonEnergy = cards.filter((c) => c.rarity === "Common" && !isEnergyCard(c) && !c.isShiny);
+  const others = cards.filter((c) => c.rarity !== "Common" && !c.isShiny);
 
   const pulled = [];
-  // Una sola energía por sobre, con una chance de que aparezca (60%) como cualquier común
   const includeEnergy = energies.length > 0 && Math.random() < 0.6;
   const commonSlots = CARDS_PER_PACK - 1 - (includeEnergy ? 1 : 0);
 
   for (let i = 0; i < commonSlots; i++) {
-    pulled.push(weightedPick(commonsNonEnergy.length ? commonsNonEnergy : cards));
+    const card = weightedPick(commonsNonEnergy.length ? commonsNonEnergy : cards.filter((c) => !c.isShiny));
+    pulled.push(maybeMakeShiny(card, cards));
   }
   if (includeEnergy) {
     pulled.push(energies[Math.floor(Math.random() * energies.length)]);
   }
-  pulled.push(weightedPick(others.length ? others : cards));
+  const rare = weightedPick(others.length ? others : cards.filter((c) => !c.isShiny));
+  pulled.push(maybeMakeShiny(rare, cards));
   pulled.sort((a, b) => rarityRank(a.rarity) - rarityRank(b.rarity));
   return pulled;
 }
@@ -1032,6 +1075,52 @@ export default function PokeSobres() {
     [user, cards, playTone]
   );
 
+  const sellDuplicates = useCallback(
+    async (raritiesFilter) => {
+      if (!user) return { ok: false, message: "No estás logueado." };
+      const ref = doc(db, "users", user.uid);
+      try {
+        const result = await runTransaction(db, async (tx) => {
+          const snap = await tx.get(ref);
+          const data = snap.exists() ? snap.data() : emptyUserDoc();
+          const col = { ...(data.collection || {}) };
+          let totalCoins = 0;
+          let totalCards = 0;
+
+          for (const [cardId, qty] of Object.entries(col)) {
+            if (qty <= 1) continue;
+            const card = cards.find((c) => c.id === cardId);
+            if (!card) continue;
+            if (!raritiesFilter.includes(card.rarity)) continue;
+            const toSell = qty - 1;
+            const price = sellPriceFor(card.rarity) * toSell;
+            col[cardId] = 1;
+            totalCoins += price;
+            totalCards += toSell;
+          }
+
+          if (totalCards === 0) throw new Error("NOTHING_TO_SELL");
+
+          const newData = { ...data, collection: col, coins: (data.coins || 0) + totalCoins };
+          tx.set(ref, newData);
+          return { newData, totalCoins, totalCards };
+        });
+
+        setCollection(result.newData.collection);
+        setCoins(result.newData.coins);
+        setProfile(result.newData);
+        playTone(523, 0.1, "sine", 0.04);
+        playTone(659, 0.15, "sine", 0.04);
+        return { ok: true, message: `Vendiste ${result.totalCards} cartas por ${result.totalCoins} monedas.` };
+      } catch (err) {
+        if (err.message === "NOTHING_TO_SELL")
+          return { ok: false, message: "No tenés duplicados de esas rarezas para vender." };
+        return { ok: false, message: "No se pudo vender. Probá de nuevo." };
+      }
+    },
+    [user, cards, playTone]
+  );
+
   const buyExtraPack = useCallback(async () => {
     if (!user || opening || revealing) return;
     if (coins < EXTRA_PACK_COST) return;
@@ -1319,6 +1408,7 @@ export default function PokeSobres() {
             totalUnique={totalUnique}
             coins={coins}
             onSell={sellCard}
+            onSellDuplicates={sellDuplicates}
           />
         )}
         {authChecked && user && !needsUsername && loadState === "ready" && view === "friends" && !viewingFriendUid && (
@@ -2503,10 +2593,123 @@ function rarityColor(rarity) {
   return "#d8d4e8";
 }
 
-function CollectionView({ cards, collection, ownedUnique, totalUnique, coins, onSell }) {
+function CardZoomOverlay({ card, onClose }) {
+  const [tilt, setTilt] = useState({ x: 0, y: 0 });
+  const cardRef = useRef(null);
+
+  const handleMouseMove = useCallback((e) => {
+    const rect = cardRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    const dx = (e.clientX - cx) / (rect.width / 2);
+    const dy = (e.clientY - cy) / (rect.height / 2);
+    setTilt({ x: dy * -18, y: dx * 18 });
+  }, []);
+
+  const handleMouseLeave = useCallback(() => {
+    setTilt({ x: 0, y: 0 });
+  }, []);
+
+  const shinyKeyframe = card.isShiny
+    ? `@keyframes shinyZoomGlow {
+        0%   { filter: hue-rotate(0deg) saturate(2) brightness(1.2); }
+        100% { filter: hue-rotate(360deg) saturate(2) brightness(1.2); }
+      }`
+    : "";
+
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(10,6,20,0.88)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        zIndex: 2000,
+        cursor: "zoom-out",
+      }}
+    >
+      {shinyKeyframe && <style>{shinyKeyframe}</style>}
+      <div
+        ref={cardRef}
+        onMouseMove={handleMouseMove}
+        onMouseLeave={handleMouseLeave}
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          width: "280px",
+          perspective: "800px",
+          cursor: "default",
+        }}
+      >
+        <div
+          style={{
+            transform: `rotateX(${tilt.x}deg) rotateY(${tilt.y}deg)`,
+            transition: "transform 0.08s ease-out",
+            transformStyle: "preserve-3d",
+          }}
+        >
+          <img
+            src={card.images.large || card.images.small}
+            alt={card.name}
+            style={{
+              width: "100%",
+              borderRadius: "16px",
+              boxShadow: card.isShiny
+                ? "0 0 80px 20px rgba(168,240,255,0.6), 0 0 40px 10px rgba(255,120,255,0.4)"
+                : card.rarity === "Rare Holo"
+                ? "0 0 60px 14px rgba(255,217,94,0.55)"
+                : card.rarity === "Rare"
+                ? "0 0 40px 10px rgba(159,214,255,0.4)"
+                : "0 20px 40px rgba(0,0,0,0.6)",
+              animation: card.isShiny ? "shinyZoomGlow 2s linear infinite" : "none",
+            }}
+          />
+        </div>
+        <div style={{ marginTop: "16px", textAlign: "center", color: "#f4f1ea" }}>
+          <div style={{ fontWeight: 700, fontSize: "18px" }}>
+            {card.isShiny ? "✨ " : ""}{card.name}
+          </div>
+          <div style={{ fontSize: "13px", color: card.isShiny ? "#a8f0ff" : rarityColor(card.rarity), marginTop: "4px" }}>
+            {card.isShiny ? "✨ Shiny" : card.rarity}
+          </div>
+          <div style={{ fontSize: "11px", color: "#8d87a8", marginTop: "12px" }}>
+            Click fuera para cerrar · Mové el mouse sobre la carta
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CollectionView({ cards, collection, ownedUnique, totalUnique, coins, onSell, onSellDuplicates }) {
   const completion = totalUnique ? Math.round((ownedUnique / totalUnique) * 100) : 0;
+  const [zoomedCard, setZoomedCard] = useState(null);
+  const [bulkRarities, setBulkRarities] = useState({ Common: true, Uncommon: false, Rare: false, "Rare Holo": false });
+  const [bulkStatus, setBulkStatus] = useState(null);
+  const [bulkSelling, setBulkSelling] = useState(false);
+
+  const toggleRarity = (rarity) => setBulkRarities((prev) => ({ ...prev, [rarity]: !prev[rarity] }));
+  const selectedRarities = Object.entries(bulkRarities).filter(([, v]) => v).map(([k]) => k);
+
+  const handleBulkSell = async () => {
+    if (selectedRarities.length === 0) { setBulkStatus({ ok: false, message: "Elegí al menos una rareza." }); return; }
+    setBulkSelling(true);
+    setBulkStatus(null);
+    const result = await onSellDuplicates(selectedRarities);
+    setBulkStatus(result);
+    setBulkSelling(false);
+  };
+
+  const RARITIES = ["Common", "Uncommon", "Rare", "Rare Holo"];
+  const rarityLabel = { Common: "Comunes", Uncommon: "Poco comunes", Rare: "Raras", "Rare Holo": "Raras Holo" };
+
   return (
     <div>
+      {zoomedCard && <CardZoomOverlay card={zoomedCard} onClose={() => setZoomedCard(null)} />}
+
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "20px", flexWrap: "wrap", gap: "8px" }}>
         <h2 style={{ fontSize: "20px", fontWeight: 700, margin: 0 }}>Mi colección</h2>
         <div style={{ display: "flex", alignItems: "center", gap: "16px" }}>
@@ -2518,8 +2721,60 @@ function CollectionView({ cards, collection, ownedUnique, totalUnique, coins, on
           </span>
         </div>
       </div>
-      <p style={{ color: "#8d87a8", fontSize: "12px", marginTop: "-8px", marginBottom: "18px" }}>
-        Podés vender las cartas que te sobren a cambio de monedas.
+
+      {/* Panel vender duplicados */}
+      <div style={{ background: "rgba(255,255,255,0.04)", borderRadius: "12px", padding: "14px 16px", marginBottom: "20px" }}>
+        <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "10px", color: "#c9c3e0" }}>
+          Vender duplicados en bulk
+        </div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "8px", marginBottom: "10px" }}>
+          {RARITIES.map((r) => (
+            <button
+              key={r}
+              onClick={() => toggleRarity(r)}
+              style={{
+                background: bulkRarities[r] ? "rgba(255,217,94,0.2)" : "rgba(255,255,255,0.05)",
+                color: bulkRarities[r] ? "#ffd95e" : "#8d87a8",
+                border: `1px solid ${bulkRarities[r] ? "rgba(255,217,94,0.5)" : "rgba(255,255,255,0.12)"}`,
+                borderRadius: "999px",
+                padding: "5px 14px",
+                fontSize: "12px",
+                fontWeight: 600,
+                cursor: "pointer",
+              }}
+            >
+              {rarityLabel[r]}
+            </button>
+          ))}
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+          <button
+            onClick={handleBulkSell}
+            disabled={bulkSelling}
+            style={{
+              background: "#ffd95e",
+              color: "#241b3d",
+              border: "none",
+              borderRadius: "999px",
+              padding: "8px 20px",
+              fontSize: "13px",
+              fontWeight: 700,
+              cursor: bulkSelling ? "not-allowed" : "pointer",
+              opacity: bulkSelling ? 0.6 : 1,
+            }}
+          >
+            {bulkSelling ? "Vendiendo..." : "Vender duplicados"}
+          </button>
+          {bulkStatus && (
+            <span style={{ fontSize: "12px", color: bulkStatus.ok ? "#a8e6a1" : "#f0a0a0" }}>
+              {bulkStatus.message}
+            </span>
+          )}
+        </div>
+      </div>
+
+      <p style={{ color: "#8d87a8", fontSize: "12px", marginBottom: "18px" }}>
+        Tocá una carta para verla en grande. Podés vender copias extra con el botón "Vender".
       </p>
       <div
         style={{
@@ -2535,13 +2790,19 @@ function CollectionView({ cards, collection, ownedUnique, totalUnique, coins, on
             <div
               key={card.id}
               style={{
-                background: "rgba(255,255,255,0.04)",
+                background: card.isShiny && owned ? "rgba(168,240,255,0.07)" : "rgba(255,255,255,0.04)",
                 borderRadius: "10px",
                 padding: "8px",
                 textAlign: "center",
                 opacity: owned ? 1 : 0.28,
-                border: owned ? `1px solid ${rarityColor(card.rarity)}55` : "1px solid transparent",
+                border: owned
+                  ? card.isShiny
+                    ? "1px solid rgba(168,240,255,0.5)"
+                    : `1px solid ${rarityColor(card.rarity)}55`
+                  : "1px solid transparent",
+                cursor: owned ? "pointer" : "default",
               }}
+              onClick={() => owned && setZoomedCard(card)}
             >
               <img
                 src={card.images.small}
@@ -2557,11 +2818,17 @@ function CollectionView({ cards, collection, ownedUnique, totalUnique, coins, on
                 style={{
                   width: "100%",
                   borderRadius: "6px",
-                  filter: owned ? "none" : "grayscale(1)",
+                  filter: owned
+                    ? card.isShiny
+                      ? "saturate(1.6) brightness(1.1)"
+                      : "none"
+                    : "grayscale(1)",
                   marginBottom: "6px",
                 }}
               />
-              <div style={{ fontSize: "11px", fontWeight: 600, lineHeight: 1.2 }}>{card.name}</div>
+              <div style={{ fontSize: "11px", fontWeight: 600, lineHeight: 1.2 }}>
+                {card.isShiny ? "✨ " : ""}{card.name}
+              </div>
               {owned > 1 && (
                 <div style={{ fontSize: "11px", color: "#ffd95e", fontWeight: 700, marginTop: "2px" }}>
                   ×{owned}
@@ -2569,7 +2836,7 @@ function CollectionView({ cards, collection, ownedUnique, totalUnique, coins, on
               )}
               {owned > 1 && (
                 <button
-                  onClick={() => onSell(card.id)}
+                  onClick={(e) => { e.stopPropagation(); onSell(card.id); }}
                   style={{
                     marginTop: "6px",
                     width: "100%",
@@ -2595,9 +2862,9 @@ function CollectionView({ cards, collection, ownedUnique, totalUnique, coins, on
 }
 
 function CardReveal({ card, revealKey, playTone }) {
-  const [stage, setStage] = useState("flash"); // flash -> popping -> settled
-  const isBig = card.rarity === "Rare Holo" || card.rarity === "Rare";
-  const particleColor = particleColorFor(card.rarity);
+  const [stage, setStage] = useState("flash");
+  const isBig = card.rarity === "Rare Holo" || card.rarity === "Rare" || card.isShiny;
+  const particleColor = card.isShiny ? "#a8f0ff" : particleColorFor(card.rarity);
 
   useEffect(() => {
     setStage("flash");
@@ -2618,16 +2885,33 @@ function CardReveal({ card, revealKey, playTone }) {
         : "scale(1.08) rotate(-1deg)"
       : "scale(1) rotate(0deg)";
 
+  const shinyKeyframe = card.isShiny
+    ? `@keyframes shinyGlow-${revealKey} {
+        0%   { filter: hue-rotate(0deg) saturate(1.8) brightness(1.15); }
+        25%  { filter: hue-rotate(90deg) saturate(2.2) brightness(1.25); }
+        50%  { filter: hue-rotate(180deg) saturate(2) brightness(1.2); }
+        75%  { filter: hue-rotate(270deg) saturate(2.2) brightness(1.25); }
+        100% { filter: hue-rotate(360deg) saturate(1.8) brightness(1.15); }
+      }`
+    : "";
+
   return (
-    <div
-      style={{
-        position: "relative",
-        width: "240px",
-        textAlign: "center",
-      }}
-    >
-      <FlashOverlay active={stage === "flash"} color={particleColor} intensity={isBig ? 0.85 : 0.35} />
-      {stage !== "flash" && <ParticleBurst seed={revealKey} count={particleCountFor(card.rarity)} color={particleColor} />}
+    <div style={{ position: "relative", width: "240px", textAlign: "center" }}>
+      {card.isShiny && shinyKeyframe && (
+        <style>{shinyKeyframe}</style>
+      )}
+      <FlashOverlay
+        active={stage === "flash"}
+        color={card.isShiny ? "#a8f0ff" : particleColor}
+        intensity={isBig ? 0.85 : 0.35}
+      />
+      {stage !== "flash" && (
+        <ParticleBurst
+          seed={revealKey}
+          count={card.isShiny ? 40 : particleCountFor(card.rarity)}
+          color={particleColor}
+        />
+      )}
 
       <div
         style={{
@@ -2659,17 +2943,21 @@ function CardReveal({ card, revealKey, playTone }) {
           style={{
             width: "100%",
             borderRadius: "14px",
-            boxShadow:
-              card.rarity === "Rare Holo"
-                ? "0 0 50px 10px rgba(255,217,94,0.55)"
-                : card.rarity === "Rare"
-                ? "0 0 30px 6px rgba(159,214,255,0.4)"
-                : "0 8px 24px rgba(0,0,0,0.5)",
+            boxShadow: card.isShiny
+              ? "0 0 60px 16px rgba(168,240,255,0.7), 0 0 30px 8px rgba(255,120,255,0.4)"
+              : card.rarity === "Rare Holo"
+              ? "0 0 50px 10px rgba(255,217,94,0.55)"
+              : card.rarity === "Rare"
+              ? "0 0 30px 6px rgba(159,214,255,0.4)"
+              : "0 8px 24px rgba(0,0,0,0.5)",
+            animation: card.isShiny && stage === "settled"
+              ? `shinyGlow-${revealKey} 2s linear infinite`
+              : "none",
           }}
         />
         <div style={{ marginTop: "14px", color: "#f4f1ea", fontWeight: 700, fontSize: "17px" }}>{card.name}</div>
-        <div style={{ marginTop: "2px", fontSize: "13px", fontWeight: 600, color: rarityColor(card.rarity) }}>
-          {card.rarity}
+        <div style={{ marginTop: "2px", fontSize: "13px", fontWeight: 600, color: card.isShiny ? "#a8f0ff" : rarityColor(card.rarity) }}>
+          {card.isShiny ? "✨ Shiny" : card.rarity}
         </div>
       </div>
     </div>

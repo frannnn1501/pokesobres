@@ -349,6 +349,7 @@ export default function PokeSobres() {
   const [incomingTrades, setIncomingTrades] = useState([]);
   const [outgoingTrades, setOutgoingTrades] = useState([]);
   const [tradeError, setTradeError] = useState("");
+  const [clickerUpgrades, setClickerUpgrades] = useState({ multiClick: 0, autoClick: 0, bonus: 0 });
   const [view, setView] = useState("home");
   const [revealing, setRevealing] = useState(false);
   const [revealedCards, setRevealedCards] = useState([]);
@@ -413,6 +414,7 @@ export default function PokeSobres() {
       setUsername(data.username || "");
       setFriends(data.friends || {});
       setNeedsUsername(!data.username);
+      setClickerUpgrades(data.clickerUpgrades || { multiClick: 0, autoClick: 0, bonus: 0 });
     } catch (err) {
       setAuthError("No se pudo cargar tu perfil. Probá recargar la página.");
     }
@@ -703,6 +705,49 @@ export default function PokeSobres() {
     return () => unsub();
   }, [user]);
 
+  const buyClickerUpgrade = useCallback(
+    async (upgradeKey, cost) => {
+      if (!user || coins < cost) return { ok: false, message: "No tenés suficientes monedas." };
+      const ref = doc(db, "users", user.uid);
+      try {
+        const result = await runTransaction(db, async (tx) => {
+          const snap = await tx.get(ref);
+          const data = snap.exists() ? snap.data() : emptyUserDoc();
+          if ((data.coins || 0) < cost) throw new Error("NOT_ENOUGH");
+          const newUpgrades = {
+            ...(data.clickerUpgrades || { multiClick: 0, autoClick: 0, bonus: 0 }),
+          };
+          newUpgrades[upgradeKey] = (newUpgrades[upgradeKey] || 0) + 1;
+          const newData = { ...data, coins: data.coins - cost, clickerUpgrades: newUpgrades };
+          tx.set(ref, newData);
+          return newData;
+        });
+        setCoins(result.coins);
+        setClickerUpgrades(result.clickerUpgrades);
+        setProfile(result);
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, message: "No se pudo comprar el upgrade." };
+      }
+    },
+    [user, coins]
+  );
+
+  const earnClickerCoins = useCallback(
+    async (amount) => {
+      if (!user || amount <= 0) return;
+      const ref = doc(db, "users", user.uid);
+      try {
+        const snap = await getDoc(ref);
+        const data = snap.exists() ? snap.data() : emptyUserDoc();
+        const newCoins = (data.coins || 0) + amount;
+        await updateDoc(ref, { coins: newCoins });
+        setCoins(newCoins);
+      } catch {}
+    },
+    [user]
+  );
+
   const proposeTrade = useCallback(
     async (toUsername, offerCards, offerCoins, requestCards, requestCoins) => {
       if (!user || !username) return { ok: false, message: "Necesitás tu propio username primero." };
@@ -819,7 +864,12 @@ export default function PokeSobres() {
       const card = cards.find((c) => c.id === cardId);
       if (!card) return { ok: false, message: "Carta no encontrada." };
       const parsedPrice = parseInt(price, 10);
-      if (isNaN(parsedPrice) || parsedPrice < 1) return { ok: false, message: "El precio debe ser al menos 1 moneda." };
+      const minPrice = card.isShiny ? 500 : 1;
+      if (isNaN(parsedPrice) || parsedPrice < minPrice) {
+        return { ok: false, message: card.isShiny
+          ? "Las cartas shiny tienen un precio mínimo de 500 monedas."
+          : "El precio debe ser al menos 1 moneda." };
+      }
 
       const userRef = doc(db, "users", user.uid);
       try {
@@ -1039,6 +1089,10 @@ export default function PokeSobres() {
       if (!user) return;
       const card = cards.find((c) => c.id === cardId);
       if (!card) return;
+      if (card.isShiny) {
+        setAuthError("Las cartas shiny no se pueden vender al bot. Publicala en el mercado.");
+        return;
+      }
       const price = sellPriceFor(card.rarity);
       const ref = doc(db, "users", user.uid);
       try {
@@ -1091,6 +1145,7 @@ export default function PokeSobres() {
             if (qty <= 1) continue;
             const card = cards.find((c) => c.id === cardId);
             if (!card) continue;
+            if (card.isShiny) continue;
             if (!raritiesFilter.includes(card.rarity)) continue;
             const toSell = qty - 1;
             const price = sellPriceFor(card.rarity) * toSell;
@@ -1354,6 +1409,12 @@ export default function PokeSobres() {
               )}
             </button>
             <button
+              style={styles.navBtn(view === "clicker")}
+              onClick={() => setView("clicker")}
+            >
+              🎮 Clicker
+            </button>
+            <button
               onClick={logout}
               style={{
                 background: "transparent",
@@ -1455,6 +1516,16 @@ export default function PokeSobres() {
             onPropose={proposeTrade}
             onRespond={respondTrade}
             onCancel={cancelTrade}
+          />
+        )}
+        {authChecked && user && !needsUsername && loadState === "ready" && view === "clicker" && (
+          <ClickerView
+            cards={cards}
+            collection={collection}
+            coins={coins}
+            clickerUpgrades={clickerUpgrades}
+            onBuyUpgrade={buyClickerUpgrade}
+            onEarnCoins={earnClickerCoins}
           />
         )}
       </div>
@@ -2070,6 +2141,286 @@ function MarketView({ listings, cards, myUid, myCollection, coins, marketError, 
   );
 }
 
+const CLICKER_UPGRADES_DEF = [
+  {
+    key: "multiClick",
+    label: "Lanzador mejorado",
+    description: "Reduce clicks necesarios para 1 moneda",
+    icon: "🎯",
+    baseCost: 80,
+    costMultiplier: 2.2,
+  },
+  {
+    key: "autoClick",
+    label: "Auto-lanzador",
+    description: "Lanza solo, muy lentamente",
+    icon: "🤖",
+    baseCost: 300,
+    costMultiplier: 2.8,
+  },
+  {
+    key: "bonus",
+    label: "Poké Ball dorada",
+    description: "Duplica todas las ganancias",
+    icon: "✨",
+    baseCost: 800,
+    costMultiplier: 3.5,
+  },
+];
+
+// clicks necesarios para ganar 1 moneda base (sin upgrades)
+const BASE_CLICKS_PER_COIN = 7;
+
+function upgradeCost(def, level) {
+  return Math.floor(def.baseCost * Math.pow(def.costMultiplier, level));
+}
+
+function PokeBallSVG({ open, animating }) {
+  return (
+    <svg
+      viewBox="0 0 200 200"
+      width="200"
+      height="200"
+      style={{
+        transform: animating ? "scale(0.88) rotate(-8deg)" : "scale(1) rotate(0deg)",
+        transition: "transform 0.1s cubic-bezier(0.34,1.56,0.64,1)",
+        filter: "drop-shadow(0 8px 24px rgba(0,0,0,0.5))",
+        cursor: "pointer",
+        userSelect: "none",
+      }}
+    >
+      {/* Mitad superior roja */}
+      <clipPath id="topHalf">
+        <rect x="0" y="0" width="200" height="100" />
+      </clipPath>
+      <clipPath id="bottomHalf">
+        <rect x="0" y="100" width="200" height="100" />
+      </clipPath>
+
+      {/* Sombra base */}
+      <circle cx="100" cy="100" r="96" fill="rgba(0,0,0,0.25)" transform="translate(3,4)" />
+
+      {/* Mitad superior roja */}
+      <g style={{ transform: open ? "translateY(-8px)" : "translateY(0)", transition: "transform 0.15s ease" }}>
+        <path d="M 100 4 A 96 96 0 0 1 196 100 L 4 100 A 96 96 0 0 1 100 4 Z" fill="#e8424a" />
+        <path d="M 100 4 A 96 96 0 0 1 196 100 L 170 100 A 70 70 0 0 0 100 30 Z" fill="#ff6b72" opacity="0.5" />
+      </g>
+
+      {/* Mitad inferior blanca */}
+      <g style={{ transform: open ? "translateY(8px)" : "translateY(0)", transition: "transform 0.15s ease" }}>
+        <path d="M 4 100 A 96 96 0 0 0 196 100 L 4 100 Z" fill="#f4f1ea" />
+        <path d="M 4 100 L 196 100 A 96 96 0 0 1 196 100" fill="#d8d4e0" opacity="0.4" />
+      </g>
+
+      {/* Banda central negra */}
+      <rect x="4" y="92" width="192" height="16" fill="#1a1530" rx="2" />
+
+      {/* Botón central */}
+      <circle cx="100" cy="100" r="22" fill="#1a1530" />
+      <circle cx="100" cy="100" r="16" fill={open ? "#ffd95e" : "#f4f1ea"} style={{ transition: "fill 0.1s ease" }} />
+      <circle cx="100" cy="100" r="10" fill={open ? "#ffd95e" : "#c9c3e0"} style={{ transition: "fill 0.1s ease" }} />
+      {open && <circle cx="95" cy="95" r="3" fill="#fff" opacity="0.7" />}
+      {!open && <circle cx="93" cy="93" r="4" fill="#fff" opacity="0.5" />}
+
+      {/* Brillo superior */}
+      <ellipse cx="75" cy="55" rx="18" ry="10" fill="#fff" opacity="0.18" transform="rotate(-20 75 55)" />
+    </svg>
+  );
+}
+
+function ClickerView({ coins, clickerUpgrades, onBuyUpgrade, onEarnCoins }) {
+  const [clickCount, setClickCount] = useState(0);
+  const [sessionCoins, setSessionCoins] = useState(0);
+  const [open, setOpen] = useState(false);
+  const [animating, setAnimating] = useState(false);
+  const [floats, setFloats] = useState([]);
+  const autoRef = useRef(null);
+  const saveRef = useRef(null);
+  const pendingCoins = useRef(0);
+  const clickCountRef = useRef(0);
+
+  // clicks necesarios para 1 moneda: se reduce 1 por cada nivel de multiClick, mínimo 1
+  const clicksNeeded = Math.max(1, BASE_CLICKS_PER_COIN - (clickerUpgrades.multiClick || 0));
+  const bonusMult = Math.pow(2, clickerUpgrades.bonus || 0);
+  const autoLevel = clickerUpgrades.autoClick || 0;
+  // auto: 1 moneda cada (60 / nivel) segundos — muy lento
+  const autoIntervalSec = autoLevel > 0 ? Math.max(10, 60 / autoLevel) : 0;
+
+  const earnCoins = useCallback((amount) => {
+    const total = Math.max(1, Math.floor(amount * bonusMult));
+    setSessionCoins((s) => s + total);
+    pendingCoins.current += total;
+    const id = Date.now() + Math.random();
+    setFloats((f) => [...f, { id, value: total }]);
+    setTimeout(() => setFloats((f) => f.filter((fl) => fl.id !== id)), 900);
+  }, [bonusMult]);
+
+  // Auto-clicker muy lento
+  useEffect(() => {
+    if (autoIntervalSec <= 0) return;
+    autoRef.current = setInterval(() => earnCoins(1), autoIntervalSec * 1000);
+    return () => clearInterval(autoRef.current);
+  }, [autoIntervalSec, earnCoins]);
+
+  // Guardar en Firestore cada 15 segundos
+  useEffect(() => {
+    saveRef.current = setInterval(() => {
+      if (pendingCoins.current > 0) {
+        onEarnCoins(pendingCoins.current);
+        pendingCoins.current = 0;
+      }
+    }, 15000);
+    return () => {
+      clearInterval(saveRef.current);
+      if (pendingCoins.current > 0) {
+        onEarnCoins(pendingCoins.current);
+        pendingCoins.current = 0;
+      }
+    };
+  }, [onEarnCoins]);
+
+  const handleClick = useCallback(() => {
+    setAnimating(true);
+    setOpen(true);
+    setTimeout(() => { setAnimating(false); setOpen(false); }, 120);
+
+    clickCountRef.current += 1;
+    setClickCount(clickCountRef.current);
+
+    if (clickCountRef.current % clicksNeeded === 0) {
+      earnCoins(1);
+    }
+  }, [clicksNeeded, earnCoins]);
+
+  const handleBuyUpgrade = async (def) => {
+    const level = clickerUpgrades[def.key] || 0;
+    const cost = upgradeCost(def, level);
+    if (pendingCoins.current > 0) {
+      await onEarnCoins(pendingCoins.current);
+      pendingCoins.current = 0;
+    }
+    await onBuyUpgrade(def.key, cost);
+  };
+
+  const progress = clicksNeeded > 1 ? (clickCount % clicksNeeded) / clicksNeeded : 1;
+
+  return (
+    <div style={{ maxWidth: "680px", margin: "0 auto" }}>
+      <style>{`@keyframes floatUp { 0%{opacity:1;transform:translateY(0) scale(1)} 100%{opacity:0;transform:translateY(-70px) scale(1.3)} }`}</style>
+
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "20px" }}>
+        <h2 style={{ fontSize: "20px", fontWeight: 700, margin: 0 }}>🎮 Lanzador de Poké Balls</h2>
+        <span style={{ color: "#ffd95e", fontSize: "14px", fontWeight: 700 }}>
+          {String.fromCodePoint(0x1fa99)} Esta sesión: +{sessionCoins}
+        </span>
+      </div>
+
+      <div style={{ display: "flex", gap: "28px", flexWrap: "wrap" }}>
+        {/* Área de click */}
+        <div style={{ flex: "1", minWidth: "220px", textAlign: "center" }}>
+          <div
+            style={{ position: "relative", display: "inline-block" }}
+            onClick={handleClick}
+          >
+            <PokeBallSVG open={open} animating={animating} />
+            {floats.map((f) => (
+              <div
+                key={f.id}
+                style={{
+                  position: "absolute",
+                  left: "50%",
+                  top: "40%",
+                  transform: "translate(-50%,-50%)",
+                  color: "#ffd95e",
+                  fontWeight: 800,
+                  fontSize: "22px",
+                  pointerEvents: "none",
+                  animation: "floatUp 0.9s ease-out forwards",
+                  textShadow: "0 2px 8px rgba(0,0,0,0.6)",
+                }}
+              >
+                +{f.value} {String.fromCodePoint(0x1fa99)}
+              </div>
+            ))}
+          </div>
+
+          {/* Barra de progreso hacia la próxima moneda */}
+          <div style={{ margin: "16px auto 0", maxWidth: "200px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: "11px", color: "#8d87a8", marginBottom: "4px" }}>
+              <span>Próxima moneda</span>
+              <span>{clickCount % clicksNeeded}/{clicksNeeded} clicks</span>
+            </div>
+            <div style={{ background: "rgba(255,255,255,0.08)", borderRadius: "999px", height: "8px", overflow: "hidden" }}>
+              <div style={{
+                width: `${progress * 100}%`,
+                height: "100%",
+                background: "linear-gradient(90deg, #e8424a, #ffd95e)",
+                borderRadius: "999px",
+                transition: "width 0.1s ease",
+              }} />
+            </div>
+          </div>
+
+          {autoLevel > 0 && (
+            <div style={{ fontSize: "11px", color: "#a8e6a1", marginTop: "10px" }}>
+              🤖 Auto: 1 moneda cada {autoIntervalSec}s
+            </div>
+          )}
+        </div>
+
+        {/* Upgrades */}
+        <div style={{ flex: "1", minWidth: "200px" }}>
+          <h3 style={{ fontSize: "14px", color: "#c9c3e0", marginBottom: "12px" }}>Mejoras</h3>
+          <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+            {CLICKER_UPGRADES_DEF.map((def) => {
+              const level = clickerUpgrades[def.key] || 0;
+              const cost = upgradeCost(def, level);
+              const canAfford = coins >= cost;
+              return (
+                <div
+                  key={def.key}
+                  style={{
+                    background: "rgba(255,255,255,0.05)",
+                    borderRadius: "12px",
+                    padding: "12px 14px",
+                    border: canAfford ? "1px solid rgba(255,217,94,0.3)" : "1px solid rgba(255,255,255,0.08)",
+                  }}
+                >
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "4px" }}>
+                    <span style={{ fontSize: "13px", fontWeight: 700 }}>
+                      {def.icon} {def.label} <span style={{ color: "#ffd95e" }}>Nv.{level}</span>
+                    </span>
+                  </div>
+                  <div style={{ fontSize: "11px", color: "#8d87a8", marginBottom: "8px" }}>{def.description}</div>
+                  <button
+                    onClick={() => handleBuyUpgrade(def)}
+                    disabled={!canAfford}
+                    style={{
+                      background: canAfford ? "#ffd95e" : "rgba(255,255,255,0.08)",
+                      color: canAfford ? "#241b3d" : "#665f80",
+                      border: "none",
+                      borderRadius: "999px",
+                      padding: "6px 16px",
+                      fontSize: "12px",
+                      fontWeight: 700,
+                      cursor: canAfford ? "pointer" : "not-allowed",
+                    }}
+                  >
+                    {String.fromCodePoint(0x1fa99)} {cost}
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+          <p style={{ fontSize: "11px", color: "#665f80", marginTop: "14px" }}>
+            Los upgrades se guardan entre sesiones.
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function LoadingScreen() {
   return (
     <div style={{ textAlign: "center", padding: "80px 20px", color: "#c9c3e0" }}>
@@ -2612,9 +2963,12 @@ function CardZoomOverlay({ card, onClose }) {
   }, []);
 
   const shinyKeyframe = card.isShiny
-    ? `@keyframes shinyZoomGlow {
-        0%   { filter: hue-rotate(0deg) saturate(2) brightness(1.2); }
-        100% { filter: hue-rotate(360deg) saturate(2) brightness(1.2); }
+    ? `@keyframes shinyBorder {
+        0%   { border-color: #ffd95e; box-shadow: 0 0 24px 6px rgba(255,217,94,0.4), 0 20px 40px rgba(0,0,0,0.6); }
+        25%  { border-color: #a8e6a1; box-shadow: 0 0 24px 6px rgba(168,230,161,0.4), 0 20px 40px rgba(0,0,0,0.6); }
+        50%  { border-color: #9fd6ff; box-shadow: 0 0 24px 6px rgba(159,214,255,0.4), 0 20px 40px rgba(0,0,0,0.6); }
+        75%  { border-color: #f0a0f0; box-shadow: 0 0 24px 6px rgba(240,160,240,0.4), 0 20px 40px rgba(0,0,0,0.6); }
+        100% { border-color: #ffd95e; box-shadow: 0 0 24px 6px rgba(255,217,94,0.4), 0 20px 40px rgba(0,0,0,0.6); }
       }`
     : "";
 
@@ -2657,14 +3011,15 @@ function CardZoomOverlay({ card, onClose }) {
             style={{
               width: "100%",
               borderRadius: "16px",
+              border: card.isShiny ? "3px solid #ffd95e" : "none",
               boxShadow: card.isShiny
-                ? "0 0 80px 20px rgba(168,240,255,0.6), 0 0 40px 10px rgba(255,120,255,0.4)"
+                ? "0 0 24px 6px rgba(255,217,94,0.4), 0 20px 40px rgba(0,0,0,0.6)"
                 : card.rarity === "Rare Holo"
                 ? "0 0 60px 14px rgba(255,217,94,0.55)"
                 : card.rarity === "Rare"
                 ? "0 0 40px 10px rgba(159,214,255,0.4)"
                 : "0 20px 40px rgba(0,0,0,0.6)",
-              animation: card.isShiny ? "shinyZoomGlow 2s linear infinite" : "none",
+              animation: card.isShiny ? "shinyBorder 3s linear infinite" : "none",
             }}
           />
         </div>
@@ -2672,7 +3027,7 @@ function CardZoomOverlay({ card, onClose }) {
           <div style={{ fontWeight: 700, fontSize: "18px" }}>
             {card.isShiny ? "✨ " : ""}{card.name}
           </div>
-          <div style={{ fontSize: "13px", color: card.isShiny ? "#a8f0ff" : rarityColor(card.rarity), marginTop: "4px" }}>
+          <div style={{ fontSize: "13px", color: card.isShiny ? "#ffd95e" : rarityColor(card.rarity), marginTop: "4px" }}>
             {card.isShiny ? "✨ Shiny" : card.rarity}
           </div>
           <div style={{ fontSize: "11px", color: "#8d87a8", marginTop: "12px" }}>
@@ -2818,11 +3173,7 @@ function CollectionView({ cards, collection, ownedUnique, totalUnique, coins, on
                 style={{
                   width: "100%",
                   borderRadius: "6px",
-                  filter: owned
-                    ? card.isShiny
-                      ? "saturate(1.6) brightness(1.1)"
-                      : "none"
-                    : "grayscale(1)",
+                  filter: owned ? "none" : "grayscale(1)",
                   marginBottom: "6px",
                 }}
               />
@@ -2834,7 +3185,7 @@ function CollectionView({ cards, collection, ownedUnique, totalUnique, coins, on
                   ×{owned}
                 </div>
               )}
-              {owned > 1 && (
+              {owned > 1 && !card.isShiny && (
                 <button
                   onClick={(e) => { e.stopPropagation(); onSell(card.id); }}
                   style={{
@@ -2864,7 +3215,7 @@ function CollectionView({ cards, collection, ownedUnique, totalUnique, coins, on
 function CardReveal({ card, revealKey, playTone }) {
   const [stage, setStage] = useState("flash");
   const isBig = card.rarity === "Rare Holo" || card.rarity === "Rare" || card.isShiny;
-  const particleColor = card.isShiny ? "#a8f0ff" : particleColorFor(card.rarity);
+  const particleColor = card.isShiny ? "#ffd95e" : particleColorFor(card.rarity);
 
   useEffect(() => {
     setStage("flash");
@@ -2886,30 +3237,28 @@ function CardReveal({ card, revealKey, playTone }) {
       : "scale(1) rotate(0deg)";
 
   const shinyKeyframe = card.isShiny
-    ? `@keyframes shinyGlow-${revealKey} {
-        0%   { filter: hue-rotate(0deg) saturate(1.8) brightness(1.15); }
-        25%  { filter: hue-rotate(90deg) saturate(2.2) brightness(1.25); }
-        50%  { filter: hue-rotate(180deg) saturate(2) brightness(1.2); }
-        75%  { filter: hue-rotate(270deg) saturate(2.2) brightness(1.25); }
-        100% { filter: hue-rotate(360deg) saturate(1.8) brightness(1.15); }
+    ? `@keyframes shinyRevealBorder-${revealKey} {
+        0%   { border-color: #ffd95e; box-shadow: 0 0 30px 8px rgba(255,217,94,0.5); }
+        25%  { border-color: #a8e6a1; box-shadow: 0 0 30px 8px rgba(168,230,161,0.5); }
+        50%  { border-color: #9fd6ff; box-shadow: 0 0 30px 8px rgba(159,214,255,0.5); }
+        75%  { border-color: #f0a0f0; box-shadow: 0 0 30px 8px rgba(240,160,240,0.5); }
+        100% { border-color: #ffd95e; box-shadow: 0 0 30px 8px rgba(255,217,94,0.5); }
       }`
     : "";
 
   return (
     <div style={{ position: "relative", width: "240px", textAlign: "center" }}>
-      {card.isShiny && shinyKeyframe && (
-        <style>{shinyKeyframe}</style>
-      )}
+      {card.isShiny && shinyKeyframe && <style>{shinyKeyframe}</style>}
       <FlashOverlay
         active={stage === "flash"}
-        color={card.isShiny ? "#a8f0ff" : particleColor}
+        color={card.isShiny ? "#ffd95e" : particleColor}
         intensity={isBig ? 0.85 : 0.35}
       />
       {stage !== "flash" && (
         <ParticleBurst
           seed={revealKey}
           count={card.isShiny ? 40 : particleCountFor(card.rarity)}
-          color={particleColor}
+          color={card.isShiny ? "#ffd95e" : particleColor}
         />
       )}
 
@@ -2943,20 +3292,21 @@ function CardReveal({ card, revealKey, playTone }) {
           style={{
             width: "100%",
             borderRadius: "14px",
+            border: card.isShiny && stage === "settled" ? "3px solid #ffd95e" : "none",
             boxShadow: card.isShiny
-              ? "0 0 60px 16px rgba(168,240,255,0.7), 0 0 30px 8px rgba(255,120,255,0.4)"
+              ? "0 0 30px 8px rgba(255,217,94,0.5)"
               : card.rarity === "Rare Holo"
               ? "0 0 50px 10px rgba(255,217,94,0.55)"
               : card.rarity === "Rare"
               ? "0 0 30px 6px rgba(159,214,255,0.4)"
               : "0 8px 24px rgba(0,0,0,0.5)",
             animation: card.isShiny && stage === "settled"
-              ? `shinyGlow-${revealKey} 2s linear infinite`
+              ? `shinyRevealBorder-${revealKey} 3s linear infinite`
               : "none",
           }}
         />
         <div style={{ marginTop: "14px", color: "#f4f1ea", fontWeight: 700, fontSize: "17px" }}>{card.name}</div>
-        <div style={{ marginTop: "2px", fontSize: "13px", fontWeight: 600, color: card.isShiny ? "#a8f0ff" : rarityColor(card.rarity) }}>
+        <div style={{ marginTop: "2px", fontSize: "13px", fontWeight: 600, color: card.isShiny ? "#ffd95e" : rarityColor(card.rarity) }}>
           {card.isShiny ? "✨ Shiny" : card.rarity}
         </div>
       </div>

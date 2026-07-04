@@ -707,24 +707,18 @@ export default function PokeSobres() {
 
   const buyClickerUpgrade = useCallback(
     async (upgradeKey, cost) => {
-      if (!user || coins < cost) return { ok: false, message: "No tenés suficientes monedas." };
+      if (!user) return { ok: false, message: "No estás logueado." };
       const ref = doc(db, "users", user.uid);
       try {
         const result = await runTransaction(db, async (tx) => {
           const snap = await tx.get(ref);
           const data = snap.exists() ? snap.data() : emptyUserDoc();
-          // Usamos el estado local de coins porque puede haber monedas pendientes
-          // no guardadas aún — las consideramos como parte del saldo real
-          const effectiveCoins = coins;
-          if (effectiveCoins < cost) throw new Error("NOT_ENOUGH");
+          if ((data.coins || 0) < cost) throw new Error("NOT_ENOUGH");
           const newUpgrades = {
             ...(data.clickerUpgrades || { multiClick: 0, autoClick: 0, bonus: 0 }),
           };
           newUpgrades[upgradeKey] = (newUpgrades[upgradeKey] || 0) + 1;
-          // Usamos data.coins del server + ajustamos con la diferencia del estado local
-          const serverCoins = data.coins || 0;
-          const newCoins = Math.max(0, serverCoins - cost + (coins - serverCoins));
-          const newData = { ...data, coins: newCoins, clickerUpgrades: newUpgrades };
+          const newData = { ...data, coins: data.coins - cost, clickerUpgrades: newUpgrades };
           tx.set(ref, newData);
           return newData;
         });
@@ -733,24 +727,26 @@ export default function PokeSobres() {
         setProfile(result);
         return { ok: true };
       } catch (err) {
+        if (err.message === "NOT_ENOUGH") return { ok: false, message: "No tenés suficientes monedas." };
         return { ok: false, message: "No se pudo comprar el upgrade." };
       }
     },
-    [user, coins]
+    [user]
   );
 
   const earnClickerCoins = useCallback(
     async (amount) => {
       if (!user || amount <= 0) return;
-      // Actualizar estado local inmediato (sin esperar al servidor)
-      setCoins((prev) => prev + amount);
-      // Persistir en Firestore de forma incremental sin hacer getDoc
       try {
         const ref = doc(db, "users", user.uid);
-        await updateDoc(ref, { coins: coins + amount });
+        const snap = await getDoc(ref);
+        const data = snap.exists() ? snap.data() : emptyUserDoc();
+        const newCoins = (data.coins || 0) + amount;
+        await updateDoc(ref, { coins: newCoins });
+        setCoins(newCoins);
       } catch {}
     },
-    [user, coins]
+    [user]
   );
 
   const proposeTrade = useCallback(
@@ -2244,6 +2240,9 @@ function ClickerView({ coins, clickerUpgrades, onBuyUpgrade, onEarnCoins }) {
   const pendingCoins = useRef(0);
   const clickCountRef = useRef(0);
 
+  // Saldo real = monedas del servidor + monedas ganadas en esta sesión sin guardar aún
+  const effectiveCoins = coins + sessionCoins;
+
   // clicks necesarios para 1 moneda: se reduce 1 por cada nivel de multiClick, mínimo 1
   const clicksNeeded = Math.max(1, BASE_CLICKS_PER_COIN - (clickerUpgrades.multiClick || 0));
   const bonusMult = Math.pow(2, clickerUpgrades.bonus || 0);
@@ -2300,11 +2299,18 @@ function ClickerView({ coins, clickerUpgrades, onBuyUpgrade, onEarnCoins }) {
   const handleBuyUpgrade = async (def) => {
     const level = clickerUpgrades[def.key] || 0;
     const cost = upgradeCost(def, level);
+    if (effectiveCoins < cost) return;
+    // Guardar monedas pendientes antes de comprar
     if (pendingCoins.current > 0) {
-      await onEarnCoins(pendingCoins.current);
+      const pending = pendingCoins.current;
       pendingCoins.current = 0;
+      await onEarnCoins(pending);
     }
-    await onBuyUpgrade(def.key, cost);
+    const result = await onBuyUpgrade(def.key, cost);
+    if (result?.ok) {
+      // Restar el costo del saldo de sesión local para mantener consistencia
+      setSessionCoins((s) => Math.max(0, s - Math.max(0, cost - coins)));
+    }
   };
 
   const progress = clicksNeeded > 1 ? (clickCount % clicksNeeded) / clicksNeeded : 1;
@@ -2380,7 +2386,7 @@ function ClickerView({ coins, clickerUpgrades, onBuyUpgrade, onEarnCoins }) {
             {CLICKER_UPGRADES_DEF.map((def) => {
               const level = clickerUpgrades[def.key] || 0;
               const cost = upgradeCost(def, level);
-              const canAfford = coins >= cost;
+              const canAfford = effectiveCoins >= cost;
               return (
                 <div
                   key={def.key}

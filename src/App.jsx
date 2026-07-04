@@ -714,13 +714,13 @@ export default function PokeSobres() {
           const snap = await tx.get(ref);
           const data = snap.exists() ? snap.data() : emptyUserDoc();
           if ((data.coins || 0) < cost) throw new Error("NOT_ENOUGH");
-          const newUpgrades = {
-            ...(data.clickerUpgrades || { multiClick: 0, autoClick: 0, bonus: 0 }),
-          };
+          const currentUpgrades = data.clickerUpgrades || { multiClick: 0, autoClick: 0, bonus: 0 };
+          const newUpgrades = { ...currentUpgrades };
           newUpgrades[upgradeKey] = (newUpgrades[upgradeKey] || 0) + 1;
-          const newData = { ...data, coins: data.coins - cost, clickerUpgrades: newUpgrades };
-          tx.set(ref, newData);
-          return newData;
+          const newCoins = data.coins - cost;
+          // Usar update en vez de set para que Firestore pueda calcular el diff
+          tx.update(ref, { coins: newCoins, clickerUpgrades: newUpgrades });
+          return { ...data, coins: newCoins, clickerUpgrades: newUpgrades };
         });
         setCoins(result.coins);
         setClickerUpgrades(result.clickerUpgrades);

@@ -457,7 +457,7 @@ export default function PokeSobres() {
           const userSnap = await tx.get(userRef);
           const data = userSnap.exists() ? userSnap.data() : emptyUserDoc();
           tx.set(usernameRef, { uid: user.uid });
-          tx.set(userRef, { ...data, username: name });
+          tx.update(userRef, { username: name });
         });
         setUsername(name);
         setNeedsUsername(false);
@@ -627,6 +627,37 @@ export default function PokeSobres() {
     return () => unsub();
   }, []);
 
+  // Listener: mis listings que fueron vendidas → acreditarme las monedas
+  useEffect(() => {
+    if (!user) return;
+    const q = query(
+      fsCollection(db, "listings"),
+      where("sellerUid", "==", user.uid),
+      where("status", "==", "sold")
+    );
+    const unsub = onSnapshot(q, async (snap) => {
+      for (const docSnap of snap.docs) {
+        const listing = docSnap.data();
+        if (listing.sellerPaid) continue;
+        try {
+          const myRef = doc(db, "users", user.uid);
+          await runTransaction(db, async (tx) => {
+            const mySnap = await tx.get(myRef);
+            const myData = mySnap.exists() ? mySnap.data() : emptyUserDoc();
+            if (myData.lastSoldListing === docSnap.id) return;
+            tx.update(myRef, {
+              coins: (myData.coins || 0) + listing.price,
+              lastSoldListing: docSnap.id,
+            });
+            tx.update(doc(db, "listings", docSnap.id), { sellerPaid: true });
+          });
+          setCoins((c) => c + listing.price);
+        } catch {}
+      }
+    }, () => {});
+    return () => unsub();
+  }, [user]);
+
   // Trades que me proponen a mí, pendientes
   useEffect(() => {
     if (!user) { setIncomingTrades([]); return; }
@@ -715,6 +746,8 @@ export default function PokeSobres() {
           const data = snap.exists() ? snap.data() : emptyUserDoc();
           if ((data.coins || 0) < cost) throw new Error("NOT_ENOUGH");
           const currentUpgrades = data.clickerUpgrades || { multiClick: 0, autoClick: 0, bonus: 0 };
+          const def = CLICKER_UPGRADES_DEF.find((d) => d.key === upgradeKey);
+          if (def && (currentUpgrades[upgradeKey] || 0) >= def.maxLevel) throw new Error("MAX_LEVEL");
           const newUpgrades = { ...currentUpgrades };
           newUpgrades[upgradeKey] = (newUpgrades[upgradeKey] || 0) + 1;
           const newCoins = data.coins - cost;
@@ -728,6 +761,7 @@ export default function PokeSobres() {
         return { ok: true };
       } catch (err) {
         if (err.message === "NOT_ENOUGH") return { ok: false, message: "No tenés suficientes monedas." };
+        if (err.message === "MAX_LEVEL") return { ok: false, message: "Este upgrade ya está al máximo." };
         return { ok: false, message: "No se pudo comprar el upgrade." };
       }
     },
@@ -961,14 +995,12 @@ export default function PokeSobres() {
           const newBuyerCollection = { ...(buyerData.collection || {}) };
           newBuyerCollection[listing.cardId] = (newBuyerCollection[listing.cardId] || 0) + 1;
 
-          tx.update(listingRef, { status: "sold", buyerUid: user.uid, buyerUsername: username });
+          tx.update(listingRef, { status: "sold", buyerUid: user.uid, buyerUsername: username, price: listing.price });
           tx.update(buyerRef, {
             coins: (buyerData.coins || 0) - listing.price,
             collection: newBuyerCollection,
           });
-          tx.update(sellerRef, {
-            coins: (sellerData.coins || 0) + listing.price,
-          });
+          // El vendedor recibe sus monedas via listener (ver useEffect de soldListings)
         });
 
         setCoins((c) => c - listing.price);
@@ -1043,15 +1075,13 @@ export default function PokeSobres() {
           newCollection[c.id] = (newCollection[c.id] || 0) + 1;
         }
 
-        const newData = {
-          ...data,
-          displayName: user.displayName || data.displayName || "",
+        const updates = {
           lastOpenDate: today,
           opensToday: currentOpens + 1,
           collection: newCollection,
         };
-        tx.set(ref, newData);
-        return newData;
+        tx.update(ref, updates);
+        return { ...data, ...updates };
       });
 
       setCollection(result.collection);
@@ -1106,13 +1136,9 @@ export default function PokeSobres() {
           }
           const newCollection = { ...data.collection };
           newCollection[cardId] = owned - 1;
-          const newData = {
-            ...data,
-            collection: newCollection,
-            coins: (data.coins || 0) + price,
-          };
-          tx.set(ref, newData);
-          return newData;
+          const newCoins = (data.coins || 0) + price;
+          tx.update(ref, { collection: newCollection, coins: newCoins });
+          return { ...data, collection: newCollection, coins: newCoins };
         });
         setCollection(result.collection);
         setCoins(result.coins);
@@ -1157,9 +1183,9 @@ export default function PokeSobres() {
 
           if (totalCards === 0) throw new Error("NOTHING_TO_SELL");
 
-          const newData = { ...data, collection: col, coins: (data.coins || 0) + totalCoins };
-          tx.set(ref, newData);
-          return { newData, totalCoins, totalCards };
+          const newCoins = (data.coins || 0) + totalCoins;
+          tx.update(ref, { collection: col, coins: newCoins });
+          return { newData: { ...data, collection: col, coins: newCoins }, totalCoins, totalCards };
         });
 
         setCollection(result.newData.collection);
@@ -1198,14 +1224,12 @@ export default function PokeSobres() {
         for (const c of pulled) {
           newCollection[c.id] = (newCollection[c.id] || 0) + 1;
         }
-        const newData = {
-          ...data,
-          displayName: user.displayName || data.displayName || "",
+        const updates = {
           collection: newCollection,
           coins: currentCoins - EXTRA_PACK_COST,
         };
-        tx.set(ref, newData);
-        return newData;
+        tx.update(ref, updates);
+        return { ...data, ...updates };
       });
 
       setCollection(result.collection);
@@ -2150,6 +2174,7 @@ const CLICKER_UPGRADES_DEF = [
     icon: "🎯",
     baseCost: 80,
     costMultiplier: 2.2,
+    maxLevel: 4, // deja un piso de 3 clicks/moneda: nunca es "1 click = 1 moneda"
   },
   {
     key: "autoClick",
@@ -2158,19 +2183,25 @@ const CLICKER_UPGRADES_DEF = [
     icon: "🤖",
     baseCost: 300,
     costMultiplier: 2.8,
+    maxLevel: 3, // a partir de acá el intervalo ya tocó su piso (120s), más niveles no aportan
   },
   {
     key: "bonus",
     label: "Poké Ball dorada",
-    description: "Duplica todas las ganancias",
+    description: "Duplica ganancias (hasta x8)",
     icon: "✨",
     baseCost: 800,
     costMultiplier: 3.5,
+    maxLevel: 3, // tope x8 para que no escale exponencialmente sin límite
   },
 ];
 
 // clicks necesarios para ganar 1 moneda base (sin upgrades)
 const BASE_CLICKS_PER_COIN = 7;
+// piso mínimo de clicks por moneda, aunque el jugador tenga el máximo de multiClick
+const MIN_CLICKS_PER_COIN = 3;
+// tiempo mínimo entre clicks contados, para evitar macros/autoclickers de terceros
+const CLICK_COOLDOWN_MS = 90;
 
 function upgradeCost(def, level) {
   return Math.floor(def.baseCost * Math.pow(def.costMultiplier, level));
@@ -2239,16 +2270,22 @@ function ClickerView({ coins, clickerUpgrades, onBuyUpgrade, onEarnCoins }) {
   const saveRef = useRef(null);
   const pendingCoins = useRef(0);
   const clickCountRef = useRef(0);
+  const lastClickAt = useRef(0);
 
   // Saldo real = monedas del servidor + monedas ganadas en esta sesión sin guardar aún
   const effectiveCoins = coins + sessionCoins;
 
-  // clicks necesarios para 1 moneda: se reduce 1 por cada nivel de multiClick, mínimo 1
-  const clicksNeeded = Math.max(1, BASE_CLICKS_PER_COIN - (clickerUpgrades.multiClick || 0));
-  const bonusMult = Math.pow(2, clickerUpgrades.bonus || 0);
+  const multiClickDef = CLICKER_UPGRADES_DEF.find((d) => d.key === "multiClick");
+  const bonusDef = CLICKER_UPGRADES_DEF.find((d) => d.key === "bonus");
+  const multiClickLevel = Math.min(clickerUpgrades.multiClick || 0, multiClickDef.maxLevel);
+  const bonusLevel = Math.min(clickerUpgrades.bonus || 0, bonusDef.maxLevel);
+
+  // clicks necesarios para 1 moneda: se reduce 1 por cada nivel de multiClick, con piso de MIN_CLICKS_PER_COIN
+  const clicksNeeded = Math.max(MIN_CLICKS_PER_COIN, BASE_CLICKS_PER_COIN - multiClickLevel);
+  const bonusMult = Math.pow(2, bonusLevel);
   const autoLevel = clickerUpgrades.autoClick || 0;
   // auto: 1 moneda cada (60 / nivel) segundos — muy lento
-  const autoIntervalSec = autoLevel > 0 ? Math.max(10, 60 / autoLevel) : 0;
+  const autoIntervalSec = autoLevel > 0 ? Math.max(120, 300 / autoLevel) : 0;
 
   const earnCoins = useCallback((amount) => {
     const total = Math.max(1, Math.floor(amount * bonusMult));
@@ -2284,6 +2321,10 @@ function ClickerView({ coins, clickerUpgrades, onBuyUpgrade, onEarnCoins }) {
   }, [onEarnCoins]);
 
   const handleClick = useCallback(() => {
+    const now = Date.now();
+    if (now - lastClickAt.current < CLICK_COOLDOWN_MS) return;
+    lastClickAt.current = now;
+
     setAnimating(true);
     setOpen(true);
     setTimeout(() => { setAnimating(false); setOpen(false); }, 120);
@@ -2298,6 +2339,7 @@ function ClickerView({ coins, clickerUpgrades, onBuyUpgrade, onEarnCoins }) {
 
   const handleBuyUpgrade = async (def) => {
     const level = clickerUpgrades[def.key] || 0;
+    if (level >= def.maxLevel) return;
     const cost = upgradeCost(def, level);
     if (effectiveCoins < cost) return;
     // Guardar monedas pendientes antes de comprar
@@ -2384,9 +2426,10 @@ function ClickerView({ coins, clickerUpgrades, onBuyUpgrade, onEarnCoins }) {
           <h3 style={{ fontSize: "14px", color: "#c9c3e0", marginBottom: "12px" }}>Mejoras</h3>
           <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
             {CLICKER_UPGRADES_DEF.map((def) => {
-              const level = clickerUpgrades[def.key] || 0;
-              const cost = upgradeCost(def, level);
-              const canAfford = effectiveCoins >= cost;
+              const level = Math.min(clickerUpgrades[def.key] || 0, def.maxLevel);
+              const isMaxed = level >= def.maxLevel;
+              const cost = isMaxed ? null : upgradeCost(def, level);
+              const canAfford = !isMaxed && effectiveCoins >= cost;
               return (
                 <div
                   key={def.key}
@@ -2399,13 +2442,13 @@ function ClickerView({ coins, clickerUpgrades, onBuyUpgrade, onEarnCoins }) {
                 >
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "4px" }}>
                     <span style={{ fontSize: "13px", fontWeight: 700 }}>
-                      {def.icon} {def.label} <span style={{ color: "#ffd95e" }}>Nv.{level}</span>
+                      {def.icon} {def.label} <span style={{ color: "#ffd95e" }}>Nv.{level}/{def.maxLevel}</span>
                     </span>
                   </div>
                   <div style={{ fontSize: "11px", color: "#8d87a8", marginBottom: "8px" }}>{def.description}</div>
                   <button
                     onClick={() => handleBuyUpgrade(def)}
-                    disabled={!canAfford}
+                    disabled={isMaxed || !canAfford}
                     style={{
                       background: canAfford ? "#ffd95e" : "rgba(255,255,255,0.08)",
                       color: canAfford ? "#241b3d" : "#665f80",
@@ -2417,7 +2460,7 @@ function ClickerView({ coins, clickerUpgrades, onBuyUpgrade, onEarnCoins }) {
                       cursor: canAfford ? "pointer" : "not-allowed",
                     }}
                   >
-                    {String.fromCodePoint(0x1fa99)} {cost}
+                    {isMaxed ? "MÁX." : `${String.fromCodePoint(0x1fa99)} ${cost}`}
                   </button>
                 </div>
               );
